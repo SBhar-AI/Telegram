@@ -70,7 +70,7 @@ class Settings:
     github_token: str = field(default_factory=lambda: _secret("GITHUB_TOKEN"))  # optional; raises rate limits
     find_resources: bool = field(default_factory=lambda: _env("FIND_RESOURCES", "1") != "0")
     max_searches: int = field(default_factory=lambda: int(_env("MAX_SEARCHES", "6")))
-    max_repo_screens: int = field(default_factory=lambda: int(_env("MAX_REPO_SCREENS", "3")))
+    max_repo_screens: int = field(default_factory=lambda: int(_env("MAX_REPO_SCREENS", "8")))
 
     # Automatic retries
     max_attempts: int = field(default_factory=lambda: int(_env("MAX_ATTEMPTS", "3")))

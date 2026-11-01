@@ -36,6 +36,13 @@ def mocks(monkeypatch):
         return None
 
     async def fake_claude(system, content, max_tokens=2000, tool=None):
+        if tool and tool["name"] == "content_breakdown":
+            text = content if isinstance(content, str) else json.dumps(content)
+            names = [l[2:] for l in text.split("# Resources found (use these exact names)")[-1].splitlines() if l.startswith("- ")]
+            return json.dumps({"headline": "Brugada vs RBBB + resources",
+                               "items": [{"label": f"Item {i + 1}", "what_it_does": f"Explains {n}", "resource_names": [n]}
+                                         for i, n in enumerate(names)] or [{"label": "Point", "what_it_does": "Coved ST"}],
+                               "for_you": ["Use it in Galen EKG module"], "caveats": []})
         if tool and tool["name"] == "security_verdict":
             text = content if isinstance(content, str) else json.dumps(content)
             bad = "webhook.site" in text
@@ -148,6 +155,8 @@ async def drain():
             await hub.process_resources(**p)
         elif job == "skill":
             await hub.process_skill(**p)
+        elif job == "breakdown":
+            await hub.process_breakdown(**p)
 
 
 def test_claim_and_allowlist():
@@ -181,11 +190,14 @@ def test_video_link_pipeline(monkeypatch):
     assert it["category"] == "medical-education" and it["skill_candidate"]
     frames = list(Path(it["media_dir"]).glob("frame_*.jpg"))
     assert len(frames) == media.frame_count(12)
-    assert any("Brugada vs RBBB" in m and "Techniques worth stealing" in m for m in SENT)
+    assert any("Got it (#" in m for m in SENT)
+    final = [m for m in SENT if "Brugada vs RBBB + resources" in m]
+    assert len(final) == 1, SENT  # exactly one breakdown message
+    assert "github.com/someone/ekg-skills" in final[0] and "Skill draft" in final[0] and "For you" in final[0]
     assert db.search("brugada")[0]["id"] == it["id"]
     assert it["resources"][0]["github"]["skill_count"] == 1
     assert it["skill_draft"]["status"] == "pending" and it["skill_draft"]["name"] == "ekg-reel-explainer"
-    assert any("Resources from #" in m for m in SENT) and any("Skill draft from #" in m for m in SENT)
+    assert not any("Resources from #" in m or "Skill draft from #" in m for m in SENT)  # no message spam
     assert it["resources"][0]["security"]["verdict"] == "green" and it["skill_draft"]["security"]["verdict"] == "green"
     assert db.search("ekg-skills")[0]["id"] == it["id"]
 
@@ -291,7 +303,7 @@ def test_malicious_repo_is_blocked(monkeypatch):
     assert sec["why"] and sec["make_safer"]
     assert (it.get("meta") or {}).get("imported_skills") == []  # red repo's skill files are not reused
     assert "webhook.site" not in DRAFTS[-1]
-    assert any("Security: RED" in m and "How to make it safer" in m for m in SENT)
+    assert any("🔴" in m and "don't install yet" in m and "Safer:" in m for m in SENT)
 
     async def go2():
         await hub.handle_update(upd(f"/security {it['id']}"))
@@ -490,6 +502,7 @@ def test_exact_repo_beats_generic_search(monkeypatch):
 
     async def go():
         await hub.process_resources(iid, OWNER, None)
+        await drain()
     asyncio.run(go())
     res = {r["name"]: r for r in db.get(iid)["resources"]}
     assert res["Anatomy"]["url"] == "https://github.com/wheresryan22/anatomy" and res["Anatomy"]["confidence"] == "high"
@@ -497,8 +510,8 @@ def test_exact_repo_beats_generic_search(monkeypatch):
     assert web_calls == [["Mystery Prompt Pack"]]            # only the unresolved one went to web search
     mp = res["Mystery Prompt Pack"]
     assert mp["found"] is False and mp["url"] == "" and "docs.claude.com" in mp["lead"]  # generic page demoted to lead
-    msg = next(m for m in SENT if "Resources from #" in m)
-    assert "wheresryan22/anatomy" in msg and "Exact link not found" in msg and "comment SKILLS" in msg
+    msg = SENT[-1]
+    assert "wheresryan22/anatomy" in msg and "exact link not found" in msg and "comment SKILLS" in msg
 
 
 def test_slugs_trigger_lookup_even_if_analysis_lists_none(monkeypatch):

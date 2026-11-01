@@ -386,3 +386,40 @@ SKILL_TOOL = {
 async def draft_skill(material: str) -> dict[str, Any]:
     raw = await claude(SKILL_SYSTEM, material[:60000], max_tokens=6000, tool=SKILL_TOOL)
     return parse_json(raw)
+
+
+BREAKDOWN_SYSTEM = """You write the single Telegram reply Sahil gets after he sends a video/post to his bot. Sahil is a \
+physician (IM → cardiology/EP), chief resident for quality & patient safety at the Phoenix VA, who builds med-ed \
+simulators (Galen), short EKG teaching videos, research/QI projects and AI automations; he doesn't code himself.
+
+Break down WHAT THE CONTENT ACTUALLY COVERS, item by item, in the order presented (e.g. each of the 5 tools in a \
+"5 skills" reel; each step in a tutorial; each teaching point in a clinical video). For each item: a short label and \
+one plain sentence on what it does / what it teaches, faithful to the video. Link each item to the resources list by \
+copying the exact `name` of the matching resource into resource_names (only names from the list; empty if none). \
+Then `for_you`: 1-3 specific, practical ways this applies to Sahil's actual work (not generic). Keep it tight: this \
+is read on a phone. Do not invent links, numbers or claims. Call content_breakdown exactly once."""
+
+BREAKDOWN_TOOL = {
+    "name": "content_breakdown",
+    "description": "Record the content breakdown.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "headline": {"type": "string", "description": "e.g. '5 free Claude Code skills' (max 70 chars)"},
+            "items": {"type": "array", "items": {"type": "object", "properties": {
+                "label": {"type": "string"}, "what_it_does": {"type": "string"},
+                "resource_names": {"type": "array", "items": {"type": "string"}}},
+                "required": ["label", "what_it_does"]}},
+            "for_you": {"type": "array", "items": {"type": "string"}},
+            "caveats": {"type": "array", "items": {"type": "string"}, "description": "Accuracy caveats worth knowing (max 2)"},
+        },
+        "required": ["headline", "items", "for_you"],
+    },
+}
+
+
+async def compose_breakdown(item_text: str, resource_names: list[str], extra: str = "") -> dict[str, Any]:
+    prompt = (f"{item_text[:20000]}\n\n# Resources found (use these exact names)\n"
+              + "\n".join(f"- {n}" for n in resource_names) + (f"\n\n{extra}" if extra else ""))
+    raw = await claude(BREAKDOWN_SYSTEM, prompt, max_tokens=2000, tool=BREAKDOWN_TOOL)
+    return parse_json(raw)

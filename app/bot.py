@@ -357,7 +357,8 @@ class Hub:
             fields.update(status="error", error=err)
         self.db.update(item_id, **fields)
         label = {"url": "processing the link", "file": "processing the file", "resources": "finding resources",
-                 "skill": "drafting a skill", "tag_note": "tagging the note"}.get(job, job)
+                 "skill": "drafting a skill", "tag_note": "tagging the note",
+                 "breakdown": "writing the breakdown"}.get(job, job)
         errs = [x for x in meta["errors"] if x["job"] == job][-settings.max_attempts:]
         lines = "\n".join(f"{x['attempt']}. <code>{esc(x['error'][:300])}</code>" for x in errs)
         if p.get("chat_id"):
@@ -382,6 +383,8 @@ class Hub:
                     await self.process_resources(**p)
                 elif job == "skill":
                     await self.process_skill(**p)
+                elif job == "breakdown":
+                    await self.process_breakdown(**p)
                 self._job_done(job, p.get("item_id"))
             except Exception as e:
                 log.exception("job %s failed", job)
@@ -465,15 +468,14 @@ class Hub:
         fields["resources"] = res
         self.db.update(item_id, **fields)
         it = self.db.get(item_id)
-        await self.tg.send(chat_id, self.render(it), reply_to=mid)
+        await self.tg.send(chat_id, f"🔎 Reading {esc(info.get('full_name'))} and screening it — full breakdown in a few minutes (#{item_id}).", reply_to=mid)
         await self.tg.typing(chat_id)
         sec = await security.screen_repo(info.get("url") or url)
         res[0]["security"] = sec
         imported = self._skill_files(info) if sec["verdict"] != "red" else []
         self.db.update(item_id, resources=res, meta=self._meta(item_id) | {"imported_skills": imported, "security_checked": True})
-        await self.tg.send(chat_id, security.render(sec, info.get("full_name") or ""), reply_to=mid)
-        if settings.anthropic_key and (imported or it.get("skill_candidate")):
-            self.enqueue(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+        nxt = "skill" if settings.anthropic_key and (imported or it.get("skill_candidate")) else "breakdown"
+        self.enqueue((nxt, {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
 
     async def process_page_link(self, item_id: int, chat_id: int, mid: int, url: str, note: str, err: str) -> None:
         page = await resources.fetch_page(url)
@@ -492,19 +494,30 @@ class Hub:
                 log.warning("page analysis failed: %s", e)
         self.db.update(item_id, **fields)
         it = self.db.get(item_id)
+        if self._maybe_queue_followups(item_id, chat_id, mid, a):
+            return await self.tg.send(chat_id, self._ack(it), reply_to=mid)
         prefix = "" if page else f"🔗 Saved #{item_id}, but I couldn't read the page.\n\n"
         await self.tg.send(chat_id, prefix + self.render(it), reply_to=mid)
-        self._maybe_queue_followups(item_id, chat_id, mid, a)
 
-    def _maybe_queue_followups(self, item_id: int, chat_id: int, mid: int, a: dict) -> None:
+    def _maybe_queue_followups(self, item_id: int, chat_id: int, mid: int, a: dict) -> bool:
+        """Queue resource lookup / skill drafting. Returns True if a follow-up (and so a final breakdown) is coming."""
         if not settings.anthropic_key:
-            return
+            return False
         it = self.db.get(item_id) or {}
         slugs = resources.find_slugs(self.item_text(it)) if it else []
         if settings.find_resources and (a.get("resources") or slugs):
             self.enqueue(("resources", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
-        elif a.get("skill_candidate"):
+            return True
+        if a.get("skill_candidate"):
             self.enqueue(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+            return True
+        return False
+
+    @staticmethod
+    def _ack(it: dict) -> str:
+        return (f"✅ Got it (#{it['id']}): <b>{esc(it.get('title') or 'saved')}</b>\n"
+                "🔎 Finding the links, screening them for safety and checking for a skill — "
+                "you'll get one full breakdown in a few minutes.")
 
     @staticmethod
     def _gh_summary(info: dict) -> dict:
@@ -575,20 +588,15 @@ class Hub:
                         screened += 1
                         r["security"] = await security.screen_repo(url)
                     else:
-                        r["security"] = {"verdict": "yellow", "summary": "Not screened (per-item limit).",
-                                         "why": [], "make_safer": [f"Send /security {item_id} or the repo link itself to screen it."]}
+                        r["security"] = {"verdict": "unscreened", "summary": "Not screened yet (per-item limit).",
+                                         "why": [], "make_safer": ["Send the repo link to the bot on its own to screen it."]}
                     if r["security"]["verdict"] != "red":
                         imported += self._skill_files(info)
         meta["imported_skills"] = imported[:12]
         meta["security_checked"] = True
         self.db.update(item_id, resources=resolved, meta=meta)
-        await self.tg.send(chat_id, self.render_resources(item_id, resolved), reply_to=mid)
-        for r in resolved:
-            sec = r.get("security") or {}
-            if sec.get("why") or sec.get("verdict") in ("yellow", "red"):
-                await self.tg.send(chat_id, security.render(sec, r.get("name") or ""), reply_to=mid)
-        if imported or it.get("skill_candidate"):
-            self.enqueue(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+        need_skill = bool(imported or it.get("skill_candidate"))
+        self.enqueue(("skill" if need_skill else "breakdown", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
 
     def item_text(self, it: dict) -> str:
         parts = [
@@ -603,8 +611,10 @@ class Hub:
 
     async def process_skill(self, item_id: int, chat_id: int, mid: int | None = None, force: bool = False) -> None:
         it = self.db.get(item_id)
-        if not it or (it.get("skill_draft") and not force):
+        if not it:
             return
+        if it.get("skill_draft") and not force:  # already drafted: just send the breakdown
+            return self.enqueue(("breakdown", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
         await self.tg.typing(chat_id)
         material = ["# Saved item", self.item_text(it)]
         if it.get("resources"):
@@ -625,20 +635,100 @@ class Hub:
             if sec["verdict"] == "red":
                 draft["status"] = "blocked"
         self.db.update(item_id, skill_draft=draft)
-        if draft.get("worth_it"):
-            sec = draft["security"]
-            msg = (f"🧠 <b>Skill draft from #{item_id}: {esc(draft.get('name'))}</b> "
-                   f"{security.ICON.get(sec['verdict'], '')}\n{esc(draft.get('description'))}\n\n"
-                   f"<i>{esc(draft.get('rationale'))}</i>")
-            if draft["status"] == "blocked":
-                msg += "\n\n🔴 <b>Blocked from installation.</b> See the security report below."
-            else:
-                msg += "\n\nTo install: in Claude, say “review my skill inbox”. /skills lists everything waiting."
-            await self.tg.send(chat_id, msg, reply_to=mid)
-            msg = security.render(sec, draft.get("name") or "")
+        self.enqueue(("breakdown", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+
+    # ------------------------------------------------------------------ the one final message
+    async def process_breakdown(self, item_id: int, chat_id: int, mid: int | None = None, force: bool = False) -> None:
+        it = self.db.get(item_id)
+        if not it:
+            return
+        res = it.get("resources") or []
+        names = [r.get("name") or "" for r in res]
+        bd: dict[str, Any] = {}
+        if settings.anthropic_key:
+            try:
+                bd = await ai.compose_breakdown(self.item_text(it), names)
+            except Exception as e:
+                log.warning("breakdown compose failed, using fallback: %s", e)
+        if not bd.get("items"):
+            bd = {"headline": it.get("title") or "Saved item",
+                  "items": [{"label": "", "what_it_does": k, "resource_names": []} for k in (it.get("key_points") or [])[:8]],
+                  "for_you": [it["skill_idea"]] if it.get("skill_idea") else []}
+        meta = it.get("meta") or {}
+        meta["breakdown"] = bd
+        self.db.update(item_id, meta=meta)
+        await self.tg.send(chat_id, self.render_breakdown(self.db.get(item_id), bd), reply_to=mid)
+
+    def _res_compact(self, r: dict) -> str:
+        sec = r.get("security") or {}
+        v = sec.get("verdict")
+        if r.get("url"):
+            label = (resources.parse_github(r["url"]) and "/".join(resources.parse_github(r["url"]))) or r.get("name")
+            line = f'🔗 <a href="{esc(r["url"])}">{esc(label)}</a>'
         else:
-            msg = f"🧠 Looked at #{item_id} for a skill — not worth one: <i>{esc(draft.get('rationale'))}</i>"
-        await self.tg.send(chat_id, msg, reply_to=mid)
+            line = f"❗ {esc(r.get('name'))}: exact link not found"
+            if r.get("how_to_get"):
+                line += f" (creator says: {esc(r['how_to_get'])})"
+            if r.get("lead"):
+                line += f' · <a href="{esc(r["lead"])}">unverified lead</a>'
+        gh = r.get("github") or {}
+        if gh.get("stars") is not None:
+            st = gh["stars"]
+            line += f" · ★{st / 1000:.1f}K" if st >= 1000 else f" · ★{st}"
+        if v:
+            verdict_txt = {"red": "don't install yet", "yellow": "use with care", "green": "looks safe",
+                           "unscreened": "not screened yet"}.get(v, v)
+            line += f"\n   {security.ICON.get(v, '⚪')} <b>{verdict_txt}</b>"
+            if sec.get("summary") and v != "green":
+                line += f": {esc(sec['summary'])}"
+            if v in ("red", "yellow") and sec.get("make_safer"):
+                line += f"\n   ↳ Safer: {esc(sec['make_safer'][0])}"
+        return line
+
+    def render_breakdown(self, it: dict, bd: dict) -> str:
+        res = it.get("resources") or []
+        by_name = {(r.get("name") or "").lower(): r for r in res}
+        used: set[int] = set()
+        icon = {"video": "🎬", "image": "🖼", "link": "🔗", "note": "📝", "voice": "🎙"}.get(it.get("kind"), "•")
+        head = f"{icon} <b>#{it['id']} · {esc(bd.get('headline') or it.get('title') or '')}</b>"
+        if it.get("author") or it.get("source_url"):
+            src = esc(it.get("author") or "")
+            if it.get("source_url"):
+                src += f' · <a href="{esc(it["source_url"])}">source</a>'
+            head += "\n" + src.strip(" ·")
+        parts = [head]
+        if (it.get("meta") or {}).get("phi_flag"):
+            parts.append(f"🚨 <b>Possible patient information detected.</b> Consider /delete {it['id']}")
+        rows = []
+        for n, item in enumerate(bd.get("items") or [], 1):
+            label = f"<b>{n}. {esc(item.get('label'))}</b> — " if item.get("label") else f"<b>{n}.</b> "
+            row = label + esc(item.get("what_it_does"))
+            for nm in item.get("resource_names") or []:
+                r = by_name.get(nm.lower()) or next((x for x in res if nm.lower() in (x.get("name") or "").lower()
+                                                     or (x.get("name") or "").lower() in nm.lower()), None)
+                if r is not None and id(r) not in used:
+                    used.add(id(r))
+                    row += "\n   " + self._res_compact(r)
+            rows.append(row)
+        if rows:
+            parts.append("\n\n".join(rows))
+        leftovers = [r for r in res if id(r) not in used]
+        if leftovers:
+            parts.append("<b>Other links</b>\n" + "\n".join("• " + self._res_compact(r) for r in leftovers))
+        if bd.get("for_you"):
+            parts.append("<b>For you</b>\n" + "\n".join(f"• {esc(x)}" for x in bd["for_you"][:3]))
+        d = it.get("skill_draft") or {}
+        if d.get("worth_it"):
+            sec = d.get("security") or {}
+            line = f"🧠 <b>Skill draft:</b> {esc(d.get('name'))} {security.ICON.get(sec.get('verdict'), '')}\n{esc(d.get('description'))}"
+            line += ("\n🔴 Blocked by security screening. /security " + str(it["id"]) if d.get("status") == "blocked"
+                     else "\nTo install, tell Claude: “review my skill inbox”.")
+            parts.append(line)
+        cav = (bd.get("caveats") or [])[:2]
+        if cav:
+            parts.append("<i>⚠️ " + " · ".join(esc(c) for c in cav) + "</i>")
+        parts.append(f"<i>/security {it['id']} full safety reports · /get {it['id']} summary + transcript</i>")
+        return "\n\n".join(parts)
 
     async def cmd_retry(self, chat_id: int, arg: str, mid: int) -> None:
         if arg.strip().lower() == "failed":
@@ -837,9 +927,9 @@ class Hub:
         fields["status"] = "done"
         self.db.update(item_id, **fields)
         it = self.db.get(item_id)
+        if not fields["meta"].get("phi_flag") and self._maybe_queue_followups(item_id, chat_id, mid, a):
+            return await self.tg.send(chat_id, self._ack(it), reply_to=mid)
         await self.tg.send(chat_id, self.render(it), reply_to=mid)
-        if not (fields["meta"].get("phi_flag")):
-            self._maybe_queue_followups(item_id, chat_id, mid, a)
 
     @staticmethod
     def _analysis_fields(a: dict) -> dict[str, Any]:

@@ -28,6 +28,13 @@
   and sets needs_attention (/failed). Pending jobs are persisted in item meta and resumed after restarts.
   Item meta is now merged, not overwritten. 14 tests passing.
 
+## v5 (2026-11-01): exact links + one-message breakdown (approved by Sahil)
+- Repo slugs in the post are confirmed on GitHub directly; web search only for unresolved items, with generic results
+  demoted to "exact link not found" + how the creator says to get it. GitHub rate-limit fallback.
+- Reply flow: quick ack -> resources -> security screening (all repos, max 8) -> skill draft -> ONE breakdown message
+  (each item the video covers: what it does, link, stars, verdict + safer path; For you; skill draft; caveats).
+- Debug: /view/<secret>/json/<id> and /view/<secret>/item/<id>/refind (use a cache-busting query when fetching).
+
 ## Waiting on Sahil
 - Optional: GITHUB_TOKEN, IG_COOKIES, OPENAI_API_KEY.
 - Connect the MCP URL in Claude Settings → Connectors so the skill inbox can be reviewed.

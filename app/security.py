@@ -29,7 +29,7 @@ MAX_TARBALL = 40 * 1024 * 1024
 MAX_FILES = 4000
 MAX_EXTRACTED = 80 * 1024 * 1024
 ORDER = {"green": 0, "yellow": 1, "red": 2}
-ICON = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
+ICON = {"green": "🟢", "yellow": "🟡", "red": "🔴", "unscreened": "⚪"}
 
 REVIEW_SYSTEM = """You are an independent security reviewer for Sahil, a physician who installs Claude skills and uses \
 GitHub tools but does not write code himself. You did NOT write the material under review. Apply Anthropic's \
