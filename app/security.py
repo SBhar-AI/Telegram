@@ -117,16 +117,21 @@ async def fetch_repo(url: str, dest: Path) -> dict[str, Any]:
     api = f"https://api.github.com/repos/{owner}/{repo}"
     async with httpx.AsyncClient(timeout=60, headers=_gh_headers(), follow_redirects=True) as c:
         meta_r = await c.get(api)
-        if meta_r.status_code != 200:
+        if meta_r.status_code in (403, 429):  # rate-limited: snapshot the default branch via github.com instead
+            log.warning("GitHub API rate-limited for %s/%s; using archive download", owner, repo)
+            meta = {"full_name": f"{owner}/{repo}", "html_url": f"https://github.com/{owner}/{repo}", "default_branch": "HEAD"}
+        elif meta_r.status_code != 200:
             raise RuntimeError(f"GitHub returned {meta_r.status_code}")
-        meta = meta_r.json()
+        else:
+            meta = meta_r.json()
         branch = meta.get("default_branch") or "main"
         sha = ""
         br = await c.get(f"{api}/commits/{branch}")
         if br.status_code == 200:
             sha = br.json().get("sha", "")
         buf = io.BytesIO()
-        async with c.stream("GET", f"{api}/tarball/{sha or branch}") as r:
+        tar_url = f"{api}/tarball/{sha or branch}" if branch != "HEAD" else f"https://github.com/{owner}/{repo}/archive/HEAD.tar.gz"
+        async with c.stream("GET", tar_url) as r:
             if r.status_code != 200:
                 raise RuntimeError(f"tarball download failed ({r.status_code})")
             async for chunk in r.aiter_bytes():

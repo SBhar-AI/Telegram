@@ -46,7 +46,12 @@ async def github_info(url: str) -> dict[str, Any] | None:
     async with httpx.AsyncClient(timeout=30, headers=_gh_headers(), follow_redirects=True) as c:
         r = await c.get(api)
         if r.status_code != 200:
-            log.info("github %s/%s -> %s", owner, repo, r.status_code)
+            log.warning("github_info %s/%s -> %s (remaining=%s)", owner, repo, r.status_code, r.headers.get("x-ratelimit-remaining"))
+            if r.status_code in (403, 429):
+                basic = await verify_repo(owner, repo)
+                if basic:
+                    return {**basic, "stars": None, "skills": [], "skill_count": None,
+                            "note": "GitHub API rate-limited; details unavailable (set GITHUB_TOKEN)"}
             return {"url": f"https://github.com/{owner}/{repo}", "error": f"GitHub returned {r.status_code}"}
         meta = r.json()
         info: dict[str, Any] = {
@@ -127,7 +132,10 @@ def describe_github(info: dict[str, Any]) -> str:
 
 # ------------------------------------------------------------------ exact-match resolution
 SLUG_RE = re.compile(r"(?<![\w.@/-])(?:https?://)?(?:www\.)?(?:github\.com/)?([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})(?![\w/])")
-NOT_SLUGS = {"and/or", "w/o", "i/o", "n/a", "24/7", "km/h", "on/off", "yes/no", "input/output", "client/server", "read/write"}
+NOT_SLUGS = {"and/or", "w/o", "i/o", "n/a", "24/7", "km/h", "on/off", "yes/no", "input/output", "client/server", "read/write",
+             "before/after", "play/pause", "pros/cons", "he/she", "his/her", "true/false", "start/stop", "open/close",
+             "left/right", "up/down", "in/out", "black/white", "text/image", "front/back", "day/night", "win/loss",
+             "drag/drop", "copy/paste", "cut/paste", "save/load", "login/logout", "sign/in", "mm/dd", "dd/mm", "yy/mm"}
 GENERIC = {"skill", "skills", "claude", "code", "the", "open", "source", "free", "tool", "tools", "app", "ai", "agent",
            "agents", "github", "repo", "plugin", "plugins", "prompt", "prompts", "official", "and", "for", "with", "pack",
            "template", "templates", "mcp", "server", "best", "top", "new"}
@@ -152,12 +160,25 @@ def name_tokens(name: str) -> set[str]:
 
 
 async def verify_repo(owner: str, repo: str) -> dict[str, Any] | None:
+    """Confirm a repo exists. Uses the API; if rate-limited (anonymous limit is 60/hour per IP, and Railway IPs are
+    shared), falls back to the public github.com page, which isn't subject to the API limit."""
     async with httpx.AsyncClient(timeout=20, headers=_gh_headers(), follow_redirects=True) as c:
         r = await c.get(f"https://api.github.com/repos/{owner}/{repo}")
-    if r.status_code != 200:
+        if r.status_code == 200:
+            m = r.json()
+            return {"url": m.get("html_url"), "full_name": m.get("full_name"), "description": m.get("description") or ""}
+        if r.status_code == 404:
+            return None
+        log.warning("GitHub API %s for %s/%s (remaining=%s); falling back to web page", r.status_code, owner, repo,
+                    r.headers.get("x-ratelimit-remaining"))
+        w = await c.get(f"https://github.com/{owner}/{repo}", headers={"User-Agent": "Mozilla/5.0 (knowledge-hub)"})
+    if w.status_code != 200:
+        log.info("github.com/%s/%s -> %s", owner, repo, w.status_code)
         return None
-    m = r.json()
-    return {"url": m.get("html_url"), "full_name": m.get("full_name"), "description": m.get("description") or ""}
+    title, _ = _strip_html(w.text[:20000])
+    full = "/".join(str(w.url).rstrip("/").split("/")[-2:])
+    desc = title.split(":", 1)[1].strip() if ":" in title else ""
+    return {"url": f"https://github.com/{full}", "full_name": full, "description": desc}
 
 
 def matches(resource: dict, url: str, title: str = "", extra: str = "") -> bool:

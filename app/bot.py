@@ -543,10 +543,13 @@ class Hub:
         resolved, rest = await resources.direct_resolve(extracted, item_text)
         # 2) Repos visible in the post that the analysis didn't list as resources.
         have = {(resources.parse_github(r.get("url") or "") or ("", ""))[1].lower() for r in resolved}
-        for owner, repo in resources.find_slugs(item_text)[:10]:
+        slugs = resources.find_slugs(item_text)[:10]
+        log.info("resources #%s: %d extracted, %d resolved directly, %d slugs in post", item_id, len(extracted), len(resolved), len(slugs))
+        for owner, repo in slugs:
             if repo.lower() in have:
                 continue
             meta = await resources.verify_repo(owner, repo)
+            log.info("  slug %s/%s -> %s", owner, repo, (meta or {}).get("url"))
             if meta:
                 have.add(repo.lower())
                 resolved.append({"name": meta["full_name"], "type": "github", "found": True, "url": meta["url"],
