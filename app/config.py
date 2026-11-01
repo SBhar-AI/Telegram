@@ -72,6 +72,10 @@ class Settings:
     max_searches: int = field(default_factory=lambda: int(_env("MAX_SEARCHES", "6")))
     max_repo_screens: int = field(default_factory=lambda: int(_env("MAX_REPO_SCREENS", "3")))
 
+    # Automatic retries
+    max_attempts: int = field(default_factory=lambda: int(_env("MAX_ATTEMPTS", "3")))
+    retry_delays: list = field(default_factory=lambda: [float(x) for x in _env("RETRY_DELAYS", "30,120").split(",") if x.strip()])
+
     # Behaviour
     default_text_action: str = field(default_factory=lambda: _env("DEFAULT_TEXT_ACTION", "note").lower())
 

@@ -12,7 +12,7 @@ TMP = tempfile.mkdtemp()
 os.environ.update({
     "DATA_DIR": TMP, "TELEGRAM_BOT_TOKEN": "", "CLAIM_CODE": "abc123", "ANTHROPIC_API_KEY": "test",
     "TODOIST_API_TOKEN": "test", "MCP_SECRET": "s3cret", "TRANSCRIBE_BACKEND": "openai", "OPENAI_API_KEY": "x",
-    "PUBLIC_URL": "https://example.test",
+    "PUBLIC_URL": "https://example.test", "RETRY_DELAYS": "0,0",
 })
 
 from app import ai, bot, media, resources, security, todoist
@@ -27,6 +27,7 @@ OWNER = 555
 @pytest.fixture(autouse=True)
 def mocks(monkeypatch):
     SENT.clear()
+    hub.queue = asyncio.Queue()  # fresh queue per test (each asyncio.run is a new event loop)
 
     async def send(chat_id, text, reply_to=None):
         SENT.append(text)
@@ -371,8 +372,86 @@ def test_retry_failed(monkeypatch):
     iid = db.create("link", status="error", error="Claude API 400", source_url="https://www.instagram.com/reel/RETRY/")
 
     async def go():
-        await hub.handle_update(upd("/retry failed"))
+        await hub.handle_update(upd(f"/retry {iid}"))
         assert "Re-running" in SENT[-1]
         await drain()
     asyncio.run(go())
     assert db.get(iid)["status"] == "done" and db.get(iid)["kind"] == "video"
+
+
+async def run_worker_until(pred, timeout=20):
+    task = asyncio.create_task(hub.worker())
+    try:
+        for _ in range(int(timeout / 0.05)):
+            await asyncio.sleep(0.05)
+            if pred():
+                return True
+        return False
+    finally:
+        task.cancel()
+
+
+def test_auto_retry_then_success(monkeypatch):
+    calls = {"n": 0}
+
+    async def flaky(url, work):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError(f"transient network error {calls['n']}")
+        p = make_video(work / "source.mp4")
+        return {"path": str(p), "title": "reel", "caption": "", "author": "x", "duration": 12,
+                "webpage_url": url, "extractor": "Instagram", "upload_date": ""}
+    monkeypatch.setattr(media, "download_url", flaky)
+
+    async def go():
+        await hub.handle_update(upd("https://www.instagram.com/reel/FLAKY/"))
+        iid = db.recent(1)[0]["id"]
+        ok = await run_worker_until(lambda: db.get(iid)["status"] == "done")
+        return iid, ok
+    iid, ok = asyncio.run(go())
+    it = db.get(iid)
+    assert ok and calls["n"] == 3 and it["kind"] == "video"
+    assert not it["meta"].get("needs_attention") and "url" not in (it["meta"].get("pending_jobs") or {})
+    assert not any("failed 3 times" in m for m in SENT)
+
+
+def test_three_failures_flag_for_review(monkeypatch):
+    async def broken(url, work):
+        raise RuntimeError("Claude API 400: bad request")
+    monkeypatch.setattr(media, "download_url", broken)
+
+    async def go():
+        await hub.handle_update(upd("https://www.instagram.com/reel/BROKEN/"))
+        iid = db.recent(1)[0]["id"]
+        await run_worker_until(lambda: (db.get(iid)["meta"] or {}).get("needs_attention"))
+        return iid
+    iid = asyncio.run(go())
+    it = db.get(iid)
+    assert it["status"] == "error" and it["meta"]["attempts"]["url"] == 3
+    assert sum(1 for m in SENT if "failed 3 times" in m) == 1
+    assert sum(1 for m in SENT if "failed:" in m) == 0  # no per-attempt spam
+    final = next(m for m in SENT if "failed 3 times" in m)
+    assert final.count("Claude API 400") == 3
+
+    async def go2():
+        await hub.handle_update(upd("/failed"))
+        assert f"#{iid}" in SENT[-1]
+        await hub.handle_update(upd(f"/retry {iid}"))
+    asyncio.run(go2())
+    m = db.get(iid)["meta"]
+    assert not m.get("needs_attention") and m["attempts"] == {} and "url" in m["pending_jobs"]
+    while not hub.queue.empty():
+        hub.queue.get_nowait(); hub.queue.task_done()
+
+
+def test_resume_after_restart():
+    iid = db.create("link", status="processing", source_url="https://www.instagram.com/reel/RESUME/",
+                    meta={"pending_jobs": {"url": {"item_id": 0, "url": "https://www.instagram.com/reel/RESUME/", "note": "", "mid": 1}}})
+    meta = db.get(iid)["meta"]; meta["pending_jobs"]["url"]["item_id"] = iid; db.update(iid, meta=meta)
+    db.mark_interrupted()
+    n = hub.resume_pending()
+    assert n >= 1 and db.get(iid)["status"] == "processing"
+    jobs = []
+    while not hub.queue.empty():
+        jobs.append(hub.queue.get_nowait()); hub.queue.task_done()
+    assert any(j == "url" and p["item_id"] == iid and p["chat_id"] == OWNER for j, p in jobs)

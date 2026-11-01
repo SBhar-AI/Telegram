@@ -22,6 +22,12 @@
   MCP mark_skill_draft refuses red; skill_inbox and list_resources expose verdicts. 9 tests passing.
 - skill-security-screen skill saved by the user (Claude-side fresh review before install).
 
+## v4 (2026-11-01): fix + automatic retries
+- Fixed: claude-sonnet-5-5 rejects forced tool_choice (400) -> tool_choice=auto + instruction + one nudge.
+- Jobs retry automatically (MAX_ATTEMPTS=3, RETRY_DELAYS=30,120); after the 3rd failure one Telegram message lists all errors
+  and sets needs_attention (/failed). Pending jobs are persisted in item meta and resumed after restarts.
+  Item meta is now merged, not overwritten. 14 tests passing.
+
 ## Waiting on Sahil
 - Optional: GITHUB_TOKEN, IG_COOKIES, OPENAI_API_KEY.
 - Connect the MCP URL in Claude Settings → Connectors so the skill inbox can be reviewed.

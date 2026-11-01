@@ -32,8 +32,8 @@ mcp_app = mcp_server.mcp.streamable_http_app()
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     n = db.mark_interrupted()
-    if n:
-        log.info("marked %d interrupted items", n)
+    resumed = hub.resume_pending()
+    log.info("resumed %d pending job(s); %d interrupted item(s) without a resumable job", resumed, n)
     worker = asyncio.create_task(hub.worker())
     if tg.enabled:
         import re as _re

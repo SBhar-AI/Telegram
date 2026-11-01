@@ -36,7 +36,7 @@ HELP = """<b>Your knowledge hub</b>
 /skills — skill drafts waiting for review
 /find 12 — re-run resource search for an item · /skill 12 — draft a skill from it
 /security 12 — full security report (why + how to make it safer)
-/retry 12 — re-run a failed item · /retry failed — re-run every failed item
+Failed jobs retry automatically (3 tries). /failed — items that still failed · /retry 12 or /retry failed — try again
 /recent — latest items · /get 12 · /delete 12
 /status — health check
 
@@ -127,6 +127,8 @@ class Hub:
             return await self.cmd_todo(chat_id, arg, mid, queue=True)
         if cmd == "/resources":
             return await self.cmd_resources(chat_id, arg)
+        if cmd == "/failed":
+            return await self.cmd_failed(chat_id)
         if cmd == "/retry":
             return await self.cmd_retry(chat_id, arg, mid)
         if cmd == "/security":
@@ -137,7 +139,7 @@ class Hub:
             if not arg.lstrip("#").isdigit() or not self.db.get(int(arg.lstrip("#"))):
                 return await self.tg.send(chat_id, f"Usage: {cmd} 12 (an item number)")
             job = "resources" if cmd == "/find" else "skill"
-            self.queue.put_nowait((job, {"item_id": int(arg.lstrip("#")), "chat_id": chat_id, "mid": mid, "force": True}))
+            self.enqueue((job, {"item_id": int(arg.lstrip("#")), "chat_id": chat_id, "mid": mid, "force": True}))
             return await self.tg.send(chat_id, "⏳ On it.", reply_to=mid)
         if cmd == "/note":
             return await self.save_note(chat_id, arg, mid)
@@ -263,7 +265,7 @@ class Hub:
         item_id = self.db.create(kind, user_note=text, tags=tags, title=text[:80], status="done", **extra)
         await self.tg.send(chat_id, f"📝 Saved as #{item_id}.", reply_to=mid)
         if settings.anthropic_key and len(text) > 140:
-            self.queue.put_nowait(("tag_note", {"item_id": item_id}))
+            self.enqueue(("tag_note", {"item_id": item_id}))
         return item_id
 
     # ------------------------------------------------------------------ queueing
@@ -271,7 +273,7 @@ class Hub:
         item_id = self.db.create("link", status="processing", source_url=url, user_note=note)
         await self.tg.react(chat_id, mid)
         await self.tg.send(chat_id, f"⏳ Got it (#{item_id}). Downloading and analysing…", reply_to=mid)
-        self.queue.put_nowait(("url", {"item_id": item_id, "chat_id": chat_id, "mid": mid, "url": url, "note": note}))
+        self.enqueue(("url", {"item_id": item_id, "chat_id": chat_id, "mid": mid, "url": url, "note": note}))
 
     async def enqueue_file(self, chat_id: int, mid: int, f: dict, kind: str, note: str) -> None:
         size = int(f.get("file_size") or 0)
@@ -287,9 +289,84 @@ class Hub:
         await self.tg.react(chat_id, mid)
         if kind != "voice":
             await self.tg.send(chat_id, f"⏳ Got it (#{item_id}). Analysing…", reply_to=mid)
-        self.queue.put_nowait(
+        self.enqueue(
             ("file", {"item_id": item_id, "chat_id": chat_id, "mid": mid, "file_id": f["file_id"], "kind": kind, "note": note})
         )
+
+    # ------------------------------------------------------------------ jobs, retries, resume
+    ITEM_JOBS = ("url", "file")  # jobs that own the item's status
+
+    def enqueue(self, jp: tuple[str, dict[str, Any]]) -> None:
+        """Queue a job and remember it on the item so it survives restarts and can be retried."""
+        job, p = jp
+        if "item_id" in p:
+            it = self.db.get(p["item_id"])
+            if it:
+                meta = it.get("meta") or {}
+                pending = meta.get("pending_jobs") or {}
+                pending[job] = {k: v for k, v in p.items() if k != "force"} | ({"force": True} if p.get("force") else {})
+                meta["pending_jobs"] = pending
+                self.db.update(p["item_id"], meta=meta)
+        self.queue.put_nowait((job, p))
+
+    def _meta(self, item_id: int) -> dict[str, Any]:
+        it = self.db.get(item_id)
+        return dict((it or {}).get("meta") or {})
+
+    def _job_done(self, job: str, item_id: int | None) -> None:
+        if item_id is None:
+            return
+        it = self.db.get(item_id)
+        if not it:
+            return
+        meta = it.get("meta") or {}
+        (meta.get("pending_jobs") or {}).pop(job, None)
+        (meta.get("attempts") or {}).pop(job, None)
+        self.db.update(item_id, meta=meta)
+
+    async def _later(self, delay: float, job: str, p: dict) -> None:
+        await asyncio.sleep(delay)
+        self.queue.put_nowait((job, p))
+
+    async def _handle_failure(self, job: str, p: dict, e: Exception) -> None:
+        item_id = p.get("item_id")
+        err = f"{type(e).__name__}: {str(e)[:500]}"
+        it = self.db.get(item_id) if item_id is not None else None
+        if not it:
+            return
+        meta = it.get("meta") or {}
+        attempts = meta.setdefault("attempts", {})
+        n = int(attempts.get(job, 0)) + 1
+        attempts[job] = n
+        meta.setdefault("errors", []).append({"job": job, "attempt": n, "error": err})
+        meta["errors"] = meta["errors"][-9:]
+        if n < settings.max_attempts:
+            delay = settings.retry_delays[min(n - 1, len(settings.retry_delays) - 1)]
+            log.warning("job %s #%s failed (attempt %d/%d); retrying in %ss: %s", job, item_id, n, settings.max_attempts, delay, err)
+            if job in self.ITEM_JOBS:
+                self.db.update(item_id, status="processing", error=f"retrying ({n}/{settings.max_attempts}): {err}", meta=meta)
+            else:
+                self.db.update(item_id, meta=meta)
+            asyncio.create_task(self._later(delay, job, p))
+            return
+        # Out of attempts: stop, flag for Sahil, report every error once.
+        (meta.get("pending_jobs") or {}).pop(job, None)
+        meta["needs_attention"] = True
+        fields: dict[str, Any] = {"meta": meta}
+        if job in self.ITEM_JOBS:
+            fields.update(status="error", error=err)
+        self.db.update(item_id, **fields)
+        label = {"url": "processing the link", "file": "processing the file", "resources": "finding resources",
+                 "skill": "drafting a skill", "tag_note": "tagging the note"}.get(job, job)
+        errs = [x for x in meta["errors"] if x["job"] == job][-settings.max_attempts:]
+        lines = "\n".join(f"{x['attempt']}. <code>{esc(x['error'][:300])}</code>" for x in errs)
+        if p.get("chat_id"):
+            await self.tg.send(
+                p["chat_id"],
+                f"❌ <b>#{item_id} failed {settings.max_attempts} times</b> while {label}. Needs your look.\n\n{lines}\n\n"
+                f"/retry {item_id} to try again · /failed lists everything waiting",
+                reply_to=p.get("mid"),
+            )
 
     async def worker(self) -> None:
         while True:
@@ -305,17 +382,43 @@ class Hub:
                     await self.process_resources(**p)
                 elif job == "skill":
                     await self.process_skill(**p)
+                self._job_done(job, p.get("item_id"))
             except Exception as e:
-                log.exception("job failed")
-                if "item_id" in p:
-                    self.db.update(p["item_id"], status="error", error=str(e)[:1000])
-                if "chat_id" in p:
-                    await self.tg.send(
-                        p["chat_id"], f"⚠️ #{p.get('item_id')} failed: <code>{esc(str(e)[:600])}</code>",
-                        reply_to=p.get("mid"),
-                    )
+                log.exception("job %s failed", job)
+                try:
+                    await self._handle_failure(job, p, e)
+                except Exception:
+                    log.exception("failure handler crashed")
             finally:
                 self.queue.task_done()
+
+    def resume_pending(self) -> int:
+        """After a restart, re-queue every job that was queued, running or waiting to retry."""
+        n = 0
+        for it in self.db.recent(1000):
+            pending = (it.get("meta") or {}).get("pending_jobs") or {}
+            for job, p in pending.items():
+                if "chat_id" not in p:
+                    owners = sorted(self.owner_ids())
+                    if not owners:
+                        continue
+                    p["chat_id"] = owners[0]
+                self.queue.put_nowait((job, p))
+                n += 1
+            if pending and it["status"] == "error" and str(it.get("error", "")).startswith("Interrupted"):
+                self.db.update(it["id"], status="processing", error=None)
+        return n
+
+    async def cmd_failed(self, chat_id: int) -> None:
+        rows = [it for it in self.db.recent(300) if (it.get("meta") or {}).get("needs_attention")]
+        if not rows:
+            return await self.tg.send(chat_id, "✅ Nothing waiting — no items have failed 3 times.")
+        lines = ["<b>Needs your look</b> (failed 3×)"]
+        for it in rows[:20]:
+            last = ((it.get("meta") or {}).get("errors") or [{}])[-1]
+            lines.append(f"{self._line(it)}\n    <code>{esc(str(last.get('error', ''))[:160])}</code>")
+        lines.append("\n/retry 12 re-runs one · /retry failed re-runs all")
+        await self.tg.send(chat_id, "\n".join(lines))
 
     # ------------------------------------------------------------------ pipeline
     def _workdir(self, item_id: int) -> Path:
@@ -367,10 +470,10 @@ class Hub:
         sec = await security.screen_repo(info.get("url") or url)
         res[0]["security"] = sec
         imported = self._skill_files(info) if sec["verdict"] != "red" else []
-        self.db.update(item_id, resources=res, meta={"imported_skills": imported, "security_checked": True})
+        self.db.update(item_id, resources=res, meta=self._meta(item_id) | {"imported_skills": imported, "security_checked": True})
         await self.tg.send(chat_id, security.render(sec, info.get("full_name") or ""), reply_to=mid)
         if settings.anthropic_key and (imported or it.get("skill_candidate")):
-            self.queue.put_nowait(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+            self.enqueue(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
 
     async def process_page_link(self, item_id: int, chat_id: int, mid: int, url: str, note: str, err: str) -> None:
         page = await resources.fetch_page(url)
@@ -384,7 +487,7 @@ class Hub:
             try:
                 a = await ai.analyze_text(f"{note}\n\nPage title: {fields['title']}\n\n{fields.get('caption', '')}".strip(), url)
                 fields.update(self._analysis_fields(a))
-                fields["meta"] = {"extracted_resources": a.get("resources") or []}
+                fields["meta"] = self._meta(item_id) | {"extracted_resources": a.get("resources") or []}
             except Exception as e:
                 log.warning("page analysis failed: %s", e)
         self.db.update(item_id, **fields)
@@ -397,9 +500,9 @@ class Hub:
         if not settings.anthropic_key:
             return
         if settings.find_resources and a.get("resources"):
-            self.queue.put_nowait(("resources", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+            self.enqueue(("resources", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
         elif a.get("skill_candidate"):
-            self.queue.put_nowait(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+            self.enqueue(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
 
     @staticmethod
     def _gh_summary(info: dict) -> dict:
@@ -457,7 +560,7 @@ class Hub:
             if sec.get("why") or sec.get("verdict") in ("yellow", "red"):
                 await self.tg.send(chat_id, security.render(sec, r.get("name") or ""), reply_to=mid)
         if imported or it.get("skill_candidate"):
-            self.queue.put_nowait(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+            self.enqueue(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
 
     def item_text(self, it: dict) -> str:
         parts = [
@@ -511,23 +614,34 @@ class Hub:
 
     async def cmd_retry(self, chat_id: int, arg: str, mid: int) -> None:
         if arg.strip().lower() == "failed":
-            targets = [it for it in self.db.recent(100) if it["status"] == "error"]
+            targets = [it for it in self.db.recent(300)
+                       if it["status"] == "error" or (it.get("meta") or {}).get("needs_attention")]
         elif arg.lstrip("#").isdigit() and self.db.get(int(arg.lstrip("#"))):
             targets = [self.db.get(int(arg.lstrip("#")))]
         else:
             return await self.tg.send(chat_id, "Usage: /retry 12  or  /retry failed")
         n = 0
         for it in targets:
-            fid = (it.get("meta") or {}).get("telegram_file_id")
+            meta = it.get("meta") or {}
+            meta.pop("needs_attention", None)
+            meta["attempts"] = {}
+            self.db.update(it["id"], meta=meta)
+            if it["status"] != "error":  # item itself fine: a follow-up job failed (resources / skill)
+                last = next((x["job"] for x in reversed(meta.get("errors") or []) if x["job"] in ("resources", "skill")), None)
+                if last:
+                    self.enqueue((last, {"item_id": it["id"], "chat_id": chat_id, "mid": mid, "force": True}))
+                    n += 1
+                continue
+            fid = meta.get("telegram_file_id")
             note = it.get("user_note") or ""
             if it.get("source_url"):
                 self.db.update(it["id"], status="processing", error=None, kind="link")
-                self.queue.put_nowait(("url", {"item_id": it["id"], "chat_id": chat_id, "mid": mid,
+                self.enqueue(("url", {"item_id": it["id"], "chat_id": chat_id, "mid": mid,
                                                "url": it["source_url"], "note": note}))
             elif fid:
                 kind = it["kind"] if it["kind"] in ("video", "image", "voice") else "video"
                 self.db.update(it["id"], status="processing", error=None)
-                self.queue.put_nowait(("file", {"item_id": it["id"], "chat_id": chat_id, "mid": mid,
+                self.enqueue(("file", {"item_id": it["id"], "chat_id": chat_id, "mid": mid,
                                                 "file_id": fid, "kind": kind, "note": note}))
             else:
                 continue
@@ -644,7 +758,7 @@ class Hub:
                        title=text[:80], tags=tags)
         await self.tg.send(chat_id, f"🎙 Saved as #{item_id}:\n<i>{esc(text[:1500])}</i>", reply_to=mid)
         if settings.anthropic_key and len(text) > 140:
-            self.queue.put_nowait(("tag_note", {"item_id": item_id}))
+            self.enqueue(("tag_note", {"item_id": item_id}))
 
     async def _process_media(
         self, item_id: int, chat_id: int, mid: int, path: Path, note: str, *, url: str, title: str,
@@ -674,7 +788,7 @@ class Hub:
         fields: dict[str, Any] = {
             "kind": kind, "source_url": url or None, "title": title[:200] or None, "caption": caption or None,
             "author": author or None, "duration_s": duration, "transcript": transcript or None,
-            "media_dir": str(mdir), "meta": {**meta, "transcriber": backend, "frames": len(frames)},
+            "media_dir": str(mdir), "meta": self._meta(item_id) | {**meta, "transcriber": backend, "frames": len(frames)},
         }
         if settings.anthropic_key:
             a = await ai.analyze(kind=kind, frames=frames, transcript=transcript, caption=caption, title=title,

@@ -32,6 +32,7 @@ Browser ──▶ /view/<MCP_SECRET>/item/<id>       (private read-only item pag
 | A GitHub link | Reads the repo (README, stars, license), lists its Claude skills, and drafts a skill for you |
 | An article / web link | Reads the page, summarises it, and finds the resources it mentions |
 | Plain text | Saved as a note. `#tags` are picked up |
+| `/failed`, `/retry N`, `/retry failed` | Failed jobs retry automatically: 3 attempts, 30 s and then 2 min apart. Only after the 3rd failure do you get one message listing all 3 errors, and the item appears in `/failed` for you to review. Jobs that a restart interrupted resume on their own. |
 | `/resources`, `/skills`, `/find N`, `/skill N` | Browse found resources, see the skill inbox, re-run resource search, or force a skill draft |
 | `/todo`, `/queue`, `/ask`, `/recent`, `/get N`, `/delete N`, `/status` | See `/help` in the bot |
 
@@ -54,6 +55,7 @@ No patient information should go through this bot. The analyser flags anything t
 | `TELEGRAM_ALLOWED_USER_IDS` | no | An alternative to claiming: a comma-separated list of Telegram user IDs |
 | `GITHUB_TOKEN` | no | A read-only GitHub token. It raises the GitHub API limit from 60 to 5,000 requests an hour |
 | `FIND_RESOURCES` | no | `1` (default) looks up resources automatically. `0` makes it on-demand only (`/find N`) |
+| `MAX_ATTEMPTS` / `RETRY_DELAYS` | no | Automatic retries (default 3 attempts; delays `30,120` seconds) |
 | `MAX_REPO_SCREENS` | no | Maximum repos screened automatically per item (default 3) |
 | `MAX_SEARCHES` | no | Maximum web searches per item (default 6, at about $0.01 per search) |
 | `DEFAULT_TEXT_ACTION` | no | `note` (default) or `todo` |
