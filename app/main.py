@@ -35,6 +35,13 @@ async def lifespan(app: FastAPI):
     if n:
         log.info("marked %d interrupted items", n)
     worker = asyncio.create_task(hub.worker())
+    if tg.enabled:
+        import re as _re
+        tok = settings.telegram_token
+        log.info("telegram token check: length=%d secret_part=%d well_formed=%s", len(tok),
+                 len(tok.split(":", 1)[-1]), bool(_re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{35}", tok)))
+        me = await tg.call("getMe")
+        log.info("telegram getMe -> %s", (me or {}).get("username") if me else "FAILED (token rejected by Telegram)")
     if tg.enabled and settings.public_url:
         res = await tg.set_webhook(f"{settings.public_url}/telegram/webhook", settings.webhook_secret)
         log.info("setWebhook -> %s", res)

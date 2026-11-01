@@ -16,6 +16,14 @@ def _secret(name: str) -> str:
     return "".join(os.environ.get(name, "").split())
 
 
+def _telegram_token() -> str:
+    """Pull the bot token out of whatever got pasted (quotes, spaces, BotFather's surrounding text)."""
+    import re
+    raw = _secret("TELEGRAM_BOT_TOKEN")
+    m = re.search(r"\d{6,12}:[A-Za-z0-9_-]{30,40}", raw)
+    return m.group(0) if m else raw
+
+
 def _ids(raw: str) -> set[int]:
     out: set[int] = set()
     for part in raw.replace(" ", "").split(","):
@@ -27,7 +35,7 @@ def _ids(raw: str) -> set[int]:
 @dataclass
 class Settings:
     # Telegram
-    telegram_token: str = field(default_factory=lambda: _secret("TELEGRAM_BOT_TOKEN"))
+    telegram_token: str = field(default_factory=_telegram_token)
     allowed_user_ids: set[int] = field(default_factory=lambda: _ids(_env("TELEGRAM_ALLOWED_USER_IDS")))
     claim_code: str = field(default_factory=lambda: _secret("CLAIM_CODE"))
     webhook_secret: str = field(default_factory=lambda: _env("TELEGRAM_WEBHOOK_SECRET"))
