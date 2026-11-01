@@ -101,6 +101,15 @@ def mocks(monkeypatch):
                 "archived": False, "fork": False, "age_days": 400, "created_at": "2025-01-01", "extract_notes": []}
     monkeypatch.setattr(security, "fetch_repo", fake_fetch_repo)
 
+    KNOWN = {"someone/ekg-skills": "EKG teaching skills", "wheresryan22/anatomy": "Interactive 3D anatomy models",
+             "bad/evil-skills": "booster", "pbakaus/impeccable": "Design skill"}
+
+    async def fake_verify(owner, repo):
+        key = f"{owner}/{repo}"
+        k = next((x for x in KNOWN if x.lower() == key.lower()), None)
+        return {"url": f"https://github.com/{k}", "full_name": k, "description": KNOWN[k]} if k else None
+    monkeypatch.setattr(resources, "verify_repo", fake_verify)
+
 
 TASKS: list = []
 DRAFTS: list = []
@@ -455,3 +464,38 @@ def test_resume_after_restart():
     while not hub.queue.empty():
         jobs.append(hub.queue.get_nowait()); hub.queue.task_done()
     assert any(j == "url" and p["item_id"] == iid and p["chat_id"] == OWNER for j, p in jobs)
+
+
+def test_exact_repo_beats_generic_search(monkeypatch):
+    """Regression: reel showed 'wheresryan22/anatomy' on screen; web search returned a generic skills page."""
+    web_calls = []
+
+    async def generic_resolver(res, context):
+        web_calls.append([r["name"] for r in res])
+        return [{"name": r["name"], "type": r["type"], "found": True, "url": "https://docs.claude.com/en/docs/agents-and-tools/agent-skills",
+                 "confidence": "medium", "description": "Agent Skills overview"} for r in res]
+    monkeypatch.setattr(ai, "resolve_resources", generic_resolver)
+
+    async def generic_page(url):
+        return {"title": "Agent Skills - Claude Docs", "text": "Skills are folders...", "url": url}
+    monkeypatch.setattr(resources, "fetch_page", generic_page)
+
+    iid = db.create("video", status="done", title="5 Claude Code skills",
+                    key_points=["Skill 1: Anatomy (wheresryan22/anatomy) builds interactive 3D models",
+                                "Skill 5: Impeccable (pbakaus/impeccable) improves design quality"],
+                    meta={"extracted_resources": [
+                        {"name": "Anatomy", "type": "skill", "url": "", "context": "interactive 3D models"},
+                        {"name": "Impeccable", "type": "skill", "url": "", "identifiers": ["pbakaus/impeccable"]},
+                        {"name": "Mystery Prompt Pack", "type": "prompt", "url": "", "how_to_get": "comment SKILLS"}]})
+
+    async def go():
+        await hub.process_resources(iid, OWNER, None)
+    asyncio.run(go())
+    res = {r["name"]: r for r in db.get(iid)["resources"]}
+    assert res["Anatomy"]["url"] == "https://github.com/wheresryan22/anatomy" and res["Anatomy"]["confidence"] == "high"
+    assert res["Impeccable"]["url"] == "https://github.com/pbakaus/impeccable"
+    assert web_calls == [["Mystery Prompt Pack"]]            # only the unresolved one went to web search
+    mp = res["Mystery Prompt Pack"]
+    assert mp["found"] is False and mp["url"] == "" and "docs.claude.com" in mp["lead"]  # generic page demoted to lead
+    msg = next(m for m in SENT if "Resources from #" in m)
+    assert "wheresryan22/anatomy" in msg and "Exact link not found" in msg and "comment SKILLS" in msg

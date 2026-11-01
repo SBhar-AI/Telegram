@@ -102,15 +102,36 @@ async def view_item(secret: str, item_id: int):
         raise HTTPException(status_code=404)
     frames = sorted(Path(it["media_dir"]).glob("frame_*.jpg")) if it.get("media_dir") else []
     imgs = "".join(f'<img src="/view/{secret}/item/{item_id}/frame/{i}" loading="lazy">' for i in range(len(frames)))
-    body = esc(hub.render(it, full=True)).replace("\n", "<br>")
-    # render() emits Telegram HTML; un-escape the small tag set it uses
-    for tag in ("b", "i", "code"):
-        body = body.replace(f"&lt;{tag}&gt;", f"<{tag}>").replace(f"&lt;/{tag}&gt;", f"</{tag}>")
+    # render() already escapes all content and emits a small safe tag set (b, i, code, a href)
+    body = hub.render(it, full=True).replace("\n", "<br>")
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>#{item_id}</title><style>body{{font:16px/1.5 system-ui;max-width:760px;margin:24px auto;padding:0 16px;background:#fafafa;color:#111}}
 .g{{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin:16px 0}}img{{width:100%;border-radius:6px}}
 @media (prefers-color-scheme:dark){{body{{background:#111;color:#eee}}}}</style></head>
 <body><div class="g">{imgs}</div><div>{body}</div></body></html>"""
+
+
+@app.get("/view/{secret}/json/{item_id}")
+async def view_item_json(secret: str, item_id: int):
+    """Raw stored record (debugging what the bot extracted and resolved)."""
+    _check_secret(secret)
+    it = db.get(item_id)
+    if not it:
+        raise HTTPException(status_code=404)
+    it = dict(it)
+    for d in [it.get("skill_draft") or {}] + [r.get("security") or {} for r in it.get("resources") or []]:
+        d.pop("sha256", None)
+    return JSONResponse(it)
+
+
+@app.get("/view/{secret}/item/{item_id}/refind")
+async def refind(secret: str, item_id: int):
+    """Re-run resource resolution for an item (owner gets the result in Telegram)."""
+    _check_secret(secret)
+    if not db.get(item_id) or not hub.owner_ids():
+        raise HTTPException(status_code=404)
+    hub.enqueue(("resources", {"item_id": item_id, "chat_id": sorted(hub.owner_ids())[0], "mid": None, "force": True}))
+    return {"queued": item_id}
 
 
 @app.get("/view/{secret}/item/{item_id}/frame/{n}")

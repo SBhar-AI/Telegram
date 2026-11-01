@@ -123,3 +123,102 @@ def describe_github(info: dict[str, Any]) -> str:
     if info.get("readme"):
         parts.append("README excerpt:\n" + info["readme"][:2500])
     return "\n".join(parts)
+
+
+# ------------------------------------------------------------------ exact-match resolution
+SLUG_RE = re.compile(r"(?<![\w.@/-])(?:https?://)?(?:www\.)?(?:github\.com/)?([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})(?![\w/])")
+NOT_SLUGS = {"and/or", "w/o", "i/o", "n/a", "24/7", "km/h", "on/off", "yes/no", "input/output", "client/server", "read/write"}
+GENERIC = {"skill", "skills", "claude", "code", "the", "open", "source", "free", "tool", "tools", "app", "ai", "agent",
+           "agents", "github", "repo", "plugin", "plugins", "prompt", "prompts", "official", "and", "for", "with", "pack",
+           "template", "templates", "mcp", "server", "best", "top", "new"}
+
+
+def find_slugs(text: str) -> list[tuple[str, str]]:
+    out = []
+    for m in SLUG_RE.finditer(text or ""):
+        owner, repo = m.group(1), re.sub(r"\.git$", "", m.group(2).rstrip(".,;:)"))
+        if f"{owner}/{repo}".lower() in NOT_SLUGS or owner.isdigit() or repo.isdigit() or len(repo) < 2:
+            continue
+        if repo.lower().endswith((".png", ".jpg", ".html", ".md")):
+            continue
+        if (owner, repo) not in out:
+            out.append((owner, repo))
+    return out
+
+
+def name_tokens(name: str) -> set[str]:
+    toks = {t for t in re.findall(r"[a-z0-9]+", (name or "").lower()) if len(t) >= 3}
+    return toks - GENERIC
+
+
+async def verify_repo(owner: str, repo: str) -> dict[str, Any] | None:
+    async with httpx.AsyncClient(timeout=20, headers=_gh_headers(), follow_redirects=True) as c:
+        r = await c.get(f"https://api.github.com/repos/{owner}/{repo}")
+    if r.status_code != 200:
+        return None
+    m = r.json()
+    return {"url": m.get("html_url"), "full_name": m.get("full_name"), "description": m.get("description") or ""}
+
+
+def matches(resource: dict, url: str, title: str = "", extra: str = "") -> bool:
+    """Does this URL/page plausibly refer to this specific resource?"""
+    hay = f"{url} {title} {extra}".lower()
+    for ident in resource.get("identifiers") or []:
+        ident = ident.lower().strip()
+        if len(ident) >= 4 and ident.replace("https://", "").replace("http://", "") in hay:
+            return True
+    toks = name_tokens(resource.get("name", ""))
+    if not toks:  # name is all generic words ("Skills") -> can't verify by name
+        return False
+    return any(t in hay for t in toks)
+
+
+async def direct_resolve(resources: list[dict], item_text: str) -> tuple[list[dict], list[dict]]:
+    """Resolve resources whose GitHub slug is visible (on screen, caption, transcript) without web search.
+    Returns (resolved, unresolved)."""
+    all_slugs = find_slugs(item_text)
+    checked: dict[str, dict | None] = {}
+    resolved, unresolved = [], []
+    for r in resources:
+        own = find_slugs(" ".join([r.get("url") or "", r.get("name") or "", *(r.get("identifiers") or []), r.get("context") or ""]))
+        toks = name_tokens(r.get("name", ""))
+        candidates = own + [s for s in all_slugs if s not in own and toks and any(
+            t in s[1].lower() or s[1].lower() in t for t in toks)]
+        hit = None
+        for owner, repo in candidates[:6]:
+            key = f"{owner}/{repo}".lower()
+            if key not in checked and len(checked) < 20:
+                checked[key] = await verify_repo(owner, repo)
+            if checked.get(key):
+                hit = checked[key]
+                break
+        if hit:
+            resolved.append({**r, "found": True, "url": hit["url"], "confidence": "high",
+                             "description": r.get("context") or hit["description"],
+                             "verified": f"exact repo {hit['full_name']} read from the post and confirmed on GitHub"})
+        else:
+            unresolved.append(r)
+    return resolved, unresolved
+
+
+async def validate_resolved(resource: dict) -> dict:
+    """Reject generic/non-matching search results; never present them as the answer."""
+    url = resource.get("url") or ""
+    if not resource.get("found") or not url:
+        return resource
+    gh = parse_github(url)
+    if gh:
+        meta = await verify_repo(*gh)
+        if not meta:
+            return {**resource, "found": False, "url": "", "confidence": "low",
+                    "note": f"Search suggested {url}, but that repo doesn't exist.", "lead": url}
+        if matches(resource, meta["url"], meta["full_name"], meta["description"]):
+            return {**resource, "url": meta["url"], "verified": "repo confirmed on GitHub and name matches"}
+        return {**resource, "found": False, "url": "", "confidence": "low", "lead": meta["url"],
+                "note": f"Search returned {meta['full_name']}, which doesn't match “{resource.get('name')}”. Shown as a lead only."}
+    page = await fetch_page(url)
+    title = (page or {}).get("title", "")
+    if matches(resource, url, title):
+        return {**resource, "verified": "page name matches"}
+    return {**resource, "found": False, "url": "", "confidence": "low", "lead": url,
+            "note": f"Search returned a page (“{title[:80] or url}”) that doesn't name “{resource.get('name')}”, likely generic. Lead only."}

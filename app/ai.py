@@ -41,10 +41,22 @@ Record your analysis with the save_analysis tool, using these fields:
 - skill_idea: if skill_candidate, one or two sentences describing that skill; else ""
 - accuracy_flags: list of concerns about accuracy (empty if none)
 - phi_flag: boolean
-- resources: every concrete resource the content mentions, shows on screen, or advertises — GitHub repos, Claude/AI skills, prompts or prompt packs, apps/tools/websites, papers/guidelines, courses, templates, datasets. Include gated offers ("comment AGENT and I'll DM you the repo", "link in bio", "free guide"). For each: name (as given), type (github | skill | prompt | tool | website | paper | course | template | dataset | other), url (only if shown, said or in the caption; never guess), how_to_get (how the creator says to obtain it, e.g. "comment 'SKILL'", "link in bio", or ""), context (one line: what it is for). Empty list if none.
+- resources: every concrete resource the content mentions, shows on screen, or advertises — GitHub repos, Claude/AI skills, prompts or prompt packs, apps/tools/websites, papers/guidelines, courses, templates, datasets. Include gated offers ("comment AGENT and I'll DM you the repo", "link in bio", "free guide"). For each: name (as given), type (github | skill | prompt | tool | website | paper | course | template | dataset | other), url (only if shown, said or in the caption; never guess — but if a GitHub owner/repo slug is visible, e.g. a badge reading "wheresryan22/anatomy", set url to https://github.com/wheresryan22/anatomy), identifiers (EXACT strings seen or heard that pin down this specific resource, copied character-for-character from the frames, caption or transcript: owner/repo slugs, URLs, @handles, package names, product names; read on-screen text carefully), how_to_get (how the creator says to obtain it, e.g. "comment 'SKILL'", "link in bio", or ""), context (one line: what it is for). Empty list if none.
 """
 
-RESOLVE_SYSTEM = """You find the real, public links for resources that appeared in a social-media post Sahil saved. Use web search. For each resource: find the canonical source (prefer the official GitHub repo, official site, or the paper's DOI/PubMed page). For "comment X to get it" or "link in bio" offers, look for the creator's public repo, website, Linktree/Beacons page, newsletter or GitHub where the same thing is posted. For Claude skills, look for a public repo containing SKILL.md files. Never invent URLs: only report URLs that appeared in search results. If you can't find it with reasonable confidence, say so (found=false) and give the best lead. When done, call report_resources exactly once."""
+RESOLVE_SYSTEM = """You find the real, public link for each SPECIFIC resource that appeared in a social-media post \
+Sahil saved. Each resource is one particular item (a named repo, skill, tool, paper), not a topic.
+
+How to search: put the resource's identifiers in your queries verbatim (e.g. search "wheresryan22/anatomy", \
+"github anatomy claude skill wheresryan22"), plus the creator's handle. Prefer the official GitHub repo, official site, \
+or the paper's DOI/PubMed page. For "comment X to get it" / "link in bio" offers, look for the creator's public repo, \
+website, Linktree/Beacons page or newsletter where the same item is posted.
+
+Acceptance rule (strict): a URL counts only if it is THAT item: its name or repo slug must match. Generic pages are \
+NOT acceptable answers: articles or docs about Claude skills in general, "awesome" lists, listicles, marketplaces, \
+search pages, the platform's homepage. If you only find generic pages, set found=false, url="", and put the best \
+lead in alternatives with a note. Never invent URLs: only report URLs that appeared in search results. \
+When done, call report_resources exactly once."""
 
 RESOURCE_ITEM = {
     "type": "object",
@@ -52,6 +64,8 @@ RESOURCE_ITEM = {
         "name": {"type": "string"},
         "type": {"type": "string"},
         "url": {"type": "string"},
+        "identifiers": {"type": "array", "items": {"type": "string"},
+                        "description": "Exact on-screen/caption/transcript strings for this resource (owner/repo slugs, URLs, handles)"},
         "how_to_get": {"type": "string"},
         "context": {"type": "string"},
     },

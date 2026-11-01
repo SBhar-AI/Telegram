@@ -534,7 +534,28 @@ class Hub:
             f"Summary: {it.get('summary')}", f"Caption: {(it.get('caption') or '')[:1500]}",
             f"Transcript: {(it.get('transcript') or '')[:2000]}",
         ]))
-        resolved = await ai.resolve_resources(extracted, context)
+        item_text = self.item_text(it)
+        # 1) Exact match first: repo slugs read off the video/caption/transcript, confirmed on GitHub. No guessing.
+        resolved, rest = await resources.direct_resolve(extracted, item_text)
+        # 2) Repos visible in the post that the analysis didn't list as resources.
+        have = {(resources.parse_github(r.get("url") or "") or ("", ""))[1].lower() for r in resolved}
+        for owner, repo in resources.find_slugs(item_text)[:10]:
+            if repo.lower() in have:
+                continue
+            meta = await resources.verify_repo(owner, repo)
+            if meta:
+                have.add(repo.lower())
+                resolved.append({"name": meta["full_name"], "type": "github", "found": True, "url": meta["url"],
+                                 "confidence": "high", "description": meta["description"],
+                                 "verified": "repo slug shown in the post, confirmed on GitHub"})
+        # 3) Web search only for what is still unresolved, and reject generic / non-matching results.
+        if rest:
+            web = await ai.resolve_resources(rest, context)
+            orig = {(r.get("name") or "").lower(): r for r in rest}
+            for w in web:  # keep what the post itself said (identifiers, how to get it)
+                o = orig.get((w.get("name") or "").lower(), {})
+                merged = {k: v for k, v in o.items() if k in ("identifiers", "how_to_get", "context")} | w
+                resolved.append(await resources.validate_resolved(merged))
         imported = list(meta.get("imported_skills") or [])
         screened = 0
         for r in resolved:
@@ -698,7 +719,7 @@ class Hub:
         head = f'{icon} <a href="{esc(url)}">{name}</a>' if url else f"{icon} {name}"
         bits = []
         if not r.get("found", True):
-            bits.append("not found publicly")
+            pass
         elif r.get("confidence") and r.get("confidence") != "high":
             bits.append(f"{r['confidence']} confidence")
         gh = r.get("github") or {}
@@ -716,6 +737,12 @@ class Hub:
         line = head + (f" — {' · '.join(bits)}" if bits else "")
         if r.get("description"):
             line += f"\n    {esc(r['description'])}"
+        if not r.get("found", True):
+            line += "\n    ❗ <b>Exact link not found.</b>"
+            if r.get("lead"):
+                line += f' Unverified lead: <a href="{esc(r["lead"])}">{esc(r["lead"][:60])}</a>'
+            if r.get("how_to_get"):
+                line += f"\n    To get it from the creator: {esc(r['how_to_get'])}"
         if r.get("note"):
             line += f"\n    <i>{esc(r['note'])}</i>"
         if item_id:
