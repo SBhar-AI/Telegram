@@ -68,7 +68,7 @@ COMPILED = [(c, lvl, re.compile(rx), d) for c, lvl, rx, d in RULES]
 NEGATION = re.compile(r"(?i)\b(never|not|no|nothing|n't|avoid|prevent|block|refuse|reject|detect|flag|warn)\b")
 NEGATABLE = {"exfiltration", "instruction_manipulation"}
 
-HIDDEN_CHARS = {"​", "‌", "‍", "⁠", "﻿", "‪", "‫", "‬", "‭", "‮", "⁦", "⁧", "⁨", "⁩", "­"}
+HIDDEN_CHARS = {chr(c) for c in (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069, 0x00AD)}
 
 
 def iter_files(root):
@@ -98,14 +98,14 @@ def scan(root):
         is_binary = b"\x00" in raw[:8192]
         if ext in BINARY_EXT or is_binary:
             inventory["binaries"].append(rel)
-            findings.append(("code_execution", "HIGH", rel, 0, "Binary/archive file — cannot be reviewed as text; hash-check (e.g. VirusTotal) before trusting", f"{size} bytes"))
+            findings.append(("code_execution", "HIGH", rel, 0, "Binary/archive file - cannot be reviewed as text; hash-check (e.g. VirusTotal) before trusting", f"{size} bytes"))
             continue
         bucket = "scripts" if ext in SCRIPT_EXT or raw.startswith(b"#!") else ("markdown" if ext in {".md", ".mdx", ".txt"} else "other")
         inventory[bucket].append(rel)
         if bucket == "scripts":
             findings.append(("code_execution", "HIGH", rel, 0, "Script file present (runs with full environment access if executed)", ""))
         text = raw.decode("utf-8", "replace")
-        body = text[1:] if text.startswith("﻿") else text
+        body = text[1:] if text.startswith(chr(0xFEFF)) else text
         hidden = {c for c in body if c in HIDDEN_CHARS or unicodedata.category(c) == "Cf"}
         if hidden:
             names = ", ".join(sorted(unicodedata.name(c, hex(ord(c))) for c in hidden))
@@ -125,7 +125,7 @@ def scan(root):
     cats = {f[0] for f in findings}
     combos = []
     if "network" in cats and "sensitive_read" in cats:
-        combos.append("Reads secret/credential stores AND has network access → exfiltration risk")
+        combos.append("Reads secret/credential stores AND has network access -> exfiltration risk")
     high_obf = any(f[0] == "obfuscation" and f[1] == "HIGH" for f in findings)
     if high_obf and ("network" in cats or "code_execution" in cats):
         combos.append("Obfuscation combined with network/code execution")
@@ -162,7 +162,7 @@ def main():
         print(json.dumps(res, indent=1))
         return
     inv = res["inventory"]
-    print(f"AUTO TIER: {res['auto_tier']}   (static signals only — Claude must still do the manual checklist)")
+    print(f"AUTO TIER: {res['auto_tier']}   (static signals only - Claude must still do the manual checklist)")
     print("Inventory: " + ", ".join(f"{k}={len(v)}" for k, v in inv.items()))
     for k in ("scripts", "binaries", "symlinks"):
         if inv[k]:
