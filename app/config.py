@@ -11,6 +11,11 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+def _secret(name: str) -> str:
+    """Tokens/keys never contain whitespace; strip any that sneaks in when pasting."""
+    return "".join(os.environ.get(name, "").split())
+
+
 def _ids(raw: str) -> set[int]:
     out: set[int] = set()
     for part in raw.replace(" ", "").split(","):
@@ -22,9 +27,9 @@ def _ids(raw: str) -> set[int]:
 @dataclass
 class Settings:
     # Telegram
-    telegram_token: str = field(default_factory=lambda: _env("TELEGRAM_BOT_TOKEN"))
+    telegram_token: str = field(default_factory=lambda: _secret("TELEGRAM_BOT_TOKEN"))
     allowed_user_ids: set[int] = field(default_factory=lambda: _ids(_env("TELEGRAM_ALLOWED_USER_IDS")))
-    claim_code: str = field(default_factory=lambda: _env("CLAIM_CODE"))
+    claim_code: str = field(default_factory=lambda: _secret("CLAIM_CODE"))
     webhook_secret: str = field(default_factory=lambda: _env("TELEGRAM_WEBHOOK_SECRET"))
 
     # Public URL (Railway sets RAILWAY_PUBLIC_DOMAIN automatically once a domain exists)
@@ -34,16 +39,16 @@ class Settings:
     )
 
     # AI
-    anthropic_key: str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
+    anthropic_key: str = field(default_factory=lambda: _secret("ANTHROPIC_API_KEY"))
     claude_model: str = field(default_factory=lambda: _env("CLAUDE_MODEL", "claude-sonnet-5-5"))
-    openai_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY"))
+    openai_key: str = field(default_factory=lambda: _secret("OPENAI_API_KEY"))
     openai_transcribe_model: str = field(default_factory=lambda: _env("OPENAI_TRANSCRIBE_MODEL", "whisper-1"))
     # auto = OpenAI if key present, else local faster-whisper; or force: openai | local | none
     transcribe_backend: str = field(default_factory=lambda: _env("TRANSCRIBE_BACKEND", "auto").lower())
     local_whisper_model: str = field(default_factory=lambda: _env("LOCAL_WHISPER_MODEL", "base"))
 
     # Todoist
-    todoist_token: str = field(default_factory=lambda: _env("TODOIST_API_TOKEN"))
+    todoist_token: str = field(default_factory=lambda: _secret("TODOIST_API_TOKEN"))
     todoist_project_id: str = field(default_factory=lambda: _env("TODOIST_PROJECT_ID"))
     todoist_queue_label: str = field(default_factory=lambda: _env("TODOIST_QUEUE_LABEL", "agent"))
     todoist_capture_label: str = field(default_factory=lambda: _env("TODOIST_CAPTURE_LABEL", "telegram"))
@@ -57,7 +62,7 @@ class Settings:
     default_text_action: str = field(default_factory=lambda: _env("DEFAULT_TEXT_ACTION", "note").lower())
 
     # MCP connector for Claude / ChatGPT
-    mcp_secret: str = field(default_factory=lambda: _env("MCP_SECRET"))
+    mcp_secret: str = field(default_factory=lambda: _secret("MCP_SECRET"))
 
     # Storage
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "/data")))
