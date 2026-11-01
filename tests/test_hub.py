@@ -32,7 +32,7 @@ def mocks(monkeypatch):
     async def noop(*a, **k):
         return None
 
-    async def fake_claude(system, content, max_tokens=2000):
+    async def fake_claude(system, content, max_tokens=2000, tool=None):
         if system == ai.ASK_SYSTEM:
             return "You saved a reel on wide-complex tachycardia [#1]."
         return json.dumps({

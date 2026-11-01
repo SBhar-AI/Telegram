@@ -30,7 +30,7 @@ Extract what is reusable. Be concrete and faithful to the content: never invent 
 If the content makes medical claims that are wrong or outdated, say so in `accuracy_flags`. If anything visible looks \
 like real patient-identifying information (names, MRNs, dates of birth, faces in a clinical setting), set `phi_flag` true.
 
-Return ONLY a JSON object with these keys:
+Record your analysis with the save_analysis tool, using these fields:
 - title: short descriptive title (max 80 chars)
 - summary: 2-4 sentence summary of what the content shows/teaches
 - key_points: list of the specific facts, steps or claims (max 10)
@@ -92,12 +92,47 @@ def _transcribe_local(audio: Path) -> str:
             settings.local_whisper_model, device="cpu", compute_type="int8",
             download_root=str(settings.data_dir / "models"),
         )
-    segments, _info = _local_model.transcribe(str(audio), vad_filter=True, beam_size=1)
+    import subprocess
+
+    import numpy as np
+
+    pcm = subprocess.run(
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(audio), "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+        capture_output=True, check=True, timeout=600,
+    ).stdout
+    samples = np.frombuffer(pcm, dtype=np.float32)
+    if samples.size < 1600:
+        return ""
+    segments, _info = _local_model.transcribe(samples, vad_filter=True, beam_size=1)
     return " ".join(s.text.strip() for s in segments).strip()
 
 
 # ---------------- Claude ----------------
-async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000) -> str:
+ANALYSIS_TOOL = {
+    "name": "save_analysis",
+    "description": "Save the structured analysis of the content.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "summary": {"type": "string"},
+            "key_points": {"type": "array", "items": {"type": "string"}},
+            "techniques": {"type": "array", "items": {"type": "string"}},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "category": {"type": "string", "enum": CATEGORIES},
+            "skill_candidate": {"type": "boolean"},
+            "skill_idea": {"type": "string"},
+            "accuracy_flags": {"type": "array", "items": {"type": "string"}},
+            "phi_flag": {"type": "boolean"},
+        },
+        "required": ["title", "summary", "key_points", "techniques", "tags", "category",
+                     "skill_candidate", "skill_idea", "accuracy_flags", "phi_flag"],
+    },
+}
+
+
+async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000, tool: dict | None = None) -> str:
+    """Call Claude. With `tool`, force that tool and return its input as a JSON string."""
     if not settings.anthropic_key:
         raise AIError("ANTHROPIC_API_KEY is not set.")
     if isinstance(content, str):
@@ -108,6 +143,9 @@ async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000)
         "system": system,
         "messages": [{"role": "user", "content": content}],
     }
+    if tool:
+        body["tools"] = [tool]
+        body["tool_choice"] = {"type": "tool", "name": tool["name"]}
     headers = {
         "x-api-key": settings.anthropic_key,
         "anthropic-version": "2023-06-01",
@@ -121,6 +159,11 @@ async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000)
         if r.status_code >= 400:
             raise AIError(f"Claude API {r.status_code}: {r.text[:300]}")
         data = r.json()
+        if tool:
+            for b in data.get("content", []):
+                if b.get("type") == "tool_use":
+                    return json.dumps(b.get("input", {}))
+            log.warning("no tool_use block; stop_reason=%s", data.get("stop_reason"))
         return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
     raise AIError("Claude API unavailable after retries.")
 
@@ -128,6 +171,7 @@ async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000)
 def parse_json(text: str) -> dict[str, Any]:
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
+        log.warning("non-JSON model output: %r", text[:300])
         raise AIError("Model did not return JSON.")
     return json.loads(m.group(0))
 
@@ -160,7 +204,7 @@ async def analyze(
         f"Transcript:\n{transcript[:20000] or '(no audio / no transcript)'}",
     ]
     content.append({"type": "text", "text": "\n\n".join(ctx)})
-    raw = await claude(ANALYZE_SYSTEM, content, max_tokens=2000)
+    raw = await claude(ANALYZE_SYSTEM, content, max_tokens=2000, tool=ANALYSIS_TOOL)
     data = parse_json(raw)
     cat = str(data.get("category", "other")).lower()
     data["category"] = cat if cat in CATEGORIES else "other"
@@ -176,7 +220,7 @@ async def analyze_text(text: str, url: str = "") -> dict[str, Any]:
     raw = await claude(
         ANALYZE_SYSTEM,
         f"Content type: text note\nSource URL: {url or '(none)'}\nText:\n{text[:8000]}",
-        max_tokens=800,
+        max_tokens=800, tool=ANALYSIS_TOOL,
     )
     return parse_json(raw)
 
