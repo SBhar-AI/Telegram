@@ -548,12 +548,12 @@ class Hub:
         for owner, repo in slugs:
             if repo.lower() in have:
                 continue
-            meta = await resources.verify_repo(owner, repo)
-            log.info("  slug %s/%s -> %s", owner, repo, (meta or {}).get("url"))
-            if meta:
+            repo_meta = await resources.verify_repo(owner, repo)
+            log.info("  slug %s/%s -> %s", owner, repo, (repo_meta or {}).get("url"))
+            if repo_meta:
                 have.add(repo.lower())
-                resolved.append({"name": meta["full_name"], "type": "github", "found": True, "url": meta["url"],
-                                 "confidence": "high", "description": meta["description"],
+                resolved.append({"name": repo_meta["full_name"], "type": "github", "found": True, "url": repo_meta["url"],
+                                 "confidence": "high", "description": repo_meta["description"],
                                  "verified": "repo slug shown in the post, confirmed on GitHub"})
         # 3) Web search only for what is still unresolved, and reject generic / non-matching results.
         if rest:
