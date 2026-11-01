@@ -70,6 +70,7 @@ class Settings:
     github_token: str = field(default_factory=lambda: _secret("GITHUB_TOKEN"))  # optional; raises rate limits
     find_resources: bool = field(default_factory=lambda: _env("FIND_RESOURCES", "1") != "0")
     max_searches: int = field(default_factory=lambda: int(_env("MAX_SEARCHES", "6")))
+    max_repo_screens: int = field(default_factory=lambda: int(_env("MAX_REPO_SCREENS", "3")))
 
     # Behaviour
     default_text_action: str = field(default_factory=lambda: _env("DEFAULT_TEXT_ACTION", "note").lower())

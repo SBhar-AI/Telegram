@@ -166,7 +166,8 @@ def list_resources(type: str | None = None, limit: int = 30) -> str:
             if type and str(r.get("type", "")).lower() != type.lower():
                 continue
             out.append({"item_id": it["id"], "item_title": it.get("title"), **{k: r.get(k) for k in (
-                "name", "type", "url", "found", "confidence", "description", "free", "note", "github")}})
+                "name", "type", "url", "found", "confidence", "description", "free", "note", "github")},
+                "security": {k: (r.get("security") or {}).get(k) for k in ("verdict", "summary", "why", "make_safer")}})
             if len(out) >= limit:
                 return json.dumps(out, ensure_ascii=False)
     return json.dumps(out, ensure_ascii=False)
@@ -174,7 +175,9 @@ def list_resources(type: str | None = None, limit: int = 30) -> str:
 
 @mcp.tool()
 def skill_inbox(status: str = "pending") -> str:
-    """List skill drafts generated from Sahil's saves. status: pending (default), installed, rejected, all."""
+    """List skill drafts generated from Sahil's saves. status: pending (default), installed, rejected, blocked, all.
+    Each has a security_verdict (green/yellow/red) from the bot's automatic screen. Before proposing any draft for
+    installation, also run the skill-security-screen skill yourself (fresh review); never propose a red one."""
     rows = []
     for it in _hub.db.recent(1000):
         d = it.get("skill_draft") or {}
@@ -182,8 +185,10 @@ def skill_inbox(status: str = "pending") -> str:
             continue
         if status != "all" and d.get("status") != status:
             continue
+        sec = d.get("security") or {}
         rows.append({"item_id": it["id"], "name": d.get("name"), "description": d.get("description"),
                      "status": d.get("status"), "rationale": d.get("rationale"),
+                     "security_verdict": sec.get("verdict"), "security_summary": sec.get("summary"),
                      "safety_notes": d.get("safety_notes"), "source_item": it.get("title")})
     return json.dumps(rows, ensure_ascii=False)
 
@@ -211,6 +216,10 @@ def mark_skill_draft(item_id: int, status: str, note: str = "") -> str:
     it = _hub.db.get(int(item_id))
     if not it or not (it.get("skill_draft") or {}).get("name"):
         return "No skill draft for that item."
+    sec = (it["skill_draft"].get("security") or {})
+    if status in ("installed", "pending") and sec.get("verdict") == "red":
+        return ("Refused: this draft failed security screening (red). Do not install it. Reasons: "
+                + "; ".join(w.get("reason", "") for w in sec.get("why", [])[:5]))
     d = dict(it["skill_draft"])
     d["status"] = status
     if note:

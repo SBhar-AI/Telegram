@@ -19,7 +19,8 @@ Browser ──▶ /view/<MCP_SECRET>/item/<id>       (private read-only item pag
 2. It is analysed (frames + transcript + caption): summary, key points, reusable techniques.
 3. **Resources** it mentions, shows or advertises (GitHub repos, Claude skills, prompts, tools, papers, "comment X to get it", "link in bio") are extracted and **resolved with web search** to real public links. GitHub repos are checked for stars, last update, license and **SKILL.md files**, which are pulled in.
 4. If there is something skill-worthy, a **skill draft** (a complete SKILL.md tailored to Sahil) is written and placed in the **skill inbox**.
-5. In Claude, say "review my skill inbox". Claude reads the draft through the connector, critiques it, and shows it as a skill card you can save. Third-party skill content is treated as untrusted and flagged.
+5. **Security screening.** Every GitHub repo and every skill draft is screened against Anthropic's *Skills for enterprise* checklist. The bot downloads a snapshot pinned to a specific commit (it never runs any of it) and scans every file for the doc's risk categories plus supply-chain red flags. It checks provenance (age, stars, license, whether it's a fork). Then a separate Claude reviewer, which did not write the draft, gives a 🟢/🟡/🔴 verdict with **why** and **how to make it safer**. Skill files from 🔴 repos are never reused, and a 🔴 draft is **blocked**: the connector refuses to mark it installed. `/security N` shows the full report.
+6. In Claude, say "review my skill inbox". Claude reads the draft through the connector, critiques it, and shows it as a skill card you can save. Third-party skill content is treated as untrusted and flagged.
 
 ## What you can send
 
@@ -53,6 +54,7 @@ No patient information should go through this bot. The analyser flags anything t
 | `TELEGRAM_ALLOWED_USER_IDS` | no | An alternative to claiming: a comma-separated list of Telegram user IDs |
 | `GITHUB_TOKEN` | no | A read-only GitHub token. It raises the GitHub API limit from 60 to 5,000 requests an hour |
 | `FIND_RESOURCES` | no | `1` (default) looks up resources automatically. `0` makes it on-demand only (`/find N`) |
+| `MAX_REPO_SCREENS` | no | Maximum repos screened automatically per item (default 3) |
 | `MAX_SEARCHES` | no | Maximum web searches per item (default 6, at about $0.01 per search) |
 | `DEFAULT_TEXT_ACTION` | no | `note` (default) or `todo` |
 | `KEEP_VIDEO` | no | `1` keeps the original video files. By default only the frames are kept, to save space |

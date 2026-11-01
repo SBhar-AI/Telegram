@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from . import ai, media, resources, todoist
+from . import ai, media, resources, security, todoist
 from .config import settings
 from .db import DB
 from .telegram import BOT_API_FILE_LIMIT, Telegram, esc
@@ -35,6 +35,7 @@ HELP = """<b>Your knowledge hub</b>
 /resources — links, repos and skills found in your saves
 /skills — skill drafts waiting for review
 /find 12 — re-run resource search for an item · /skill 12 — draft a skill from it
+/security 12 — full security report (why + how to make it safer)
 /recent — latest items · /get 12 · /delete 12
 /status — health check
 
@@ -125,6 +126,8 @@ class Hub:
             return await self.cmd_todo(chat_id, arg, mid, queue=True)
         if cmd == "/resources":
             return await self.cmd_resources(chat_id, arg)
+        if cmd == "/security":
+            return await self.cmd_security(chat_id, arg)
         if cmd == "/skills":
             return await self.cmd_skills(chat_id)
         if cmd in ("/find", "/skill"):
@@ -354,11 +357,16 @@ class Hub:
         res = [{"name": info.get("full_name"), "type": "github", "found": True, "url": info.get("url"),
                 "confidence": "high", "description": info.get("description") or "", "github": self._gh_summary(info)}]
         fields["resources"] = res
-        fields["meta"] = {"imported_skills": self._skill_files(info)}
         self.db.update(item_id, **fields)
         it = self.db.get(item_id)
         await self.tg.send(chat_id, self.render(it), reply_to=mid)
-        if settings.anthropic_key and (info.get("skills") or it.get("skill_candidate")):
+        await self.tg.typing(chat_id)
+        sec = await security.screen_repo(info.get("url") or url)
+        res[0]["security"] = sec
+        imported = self._skill_files(info) if sec["verdict"] != "red" else []
+        self.db.update(item_id, resources=res, meta={"imported_skills": imported, "security_checked": True})
+        await self.tg.send(chat_id, security.render(sec, info.get("full_name") or ""), reply_to=mid)
+        if settings.anthropic_key and (imported or it.get("skill_candidate")):
             self.queue.put_nowait(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
 
     async def process_page_link(self, item_id: int, chat_id: int, mid: int, url: str, note: str, err: str) -> None:
@@ -422,16 +430,29 @@ class Hub:
         ]))
         resolved = await ai.resolve_resources(extracted, context)
         imported = list(meta.get("imported_skills") or [])
+        screened = 0
         for r in resolved:
             url = r.get("url") or ""
             if resources.parse_github(url):
                 info = await resources.github_info(url)
                 if info and not info.get("error"):
                     r["github"] = self._gh_summary(info)
-                    imported += self._skill_files(info)
+                    if screened < settings.max_repo_screens:
+                        screened += 1
+                        r["security"] = await security.screen_repo(url)
+                    else:
+                        r["security"] = {"verdict": "yellow", "summary": "Not screened (per-item limit).",
+                                         "why": [], "make_safer": [f"Send /security {item_id} or the repo link itself to screen it."]}
+                    if r["security"]["verdict"] != "red":
+                        imported += self._skill_files(info)
         meta["imported_skills"] = imported[:12]
+        meta["security_checked"] = True
         self.db.update(item_id, resources=resolved, meta=meta)
         await self.tg.send(chat_id, self.render_resources(item_id, resolved), reply_to=mid)
+        for r in resolved:
+            sec = r.get("security") or {}
+            if sec.get("why") or sec.get("verdict") in ("yellow", "red"):
+                await self.tg.send(chat_id, security.render(sec, r.get("name") or ""), reply_to=mid)
         if imported or it.get("skill_candidate"):
             self.queue.put_nowait(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
 
@@ -453,22 +474,52 @@ class Hub:
         await self.tg.typing(chat_id)
         material = ["# Saved item", self.item_text(it)]
         if it.get("resources"):
-            material += ["# Resources found", json.dumps(it["resources"], ensure_ascii=False, indent=1)[:6000]]
+            slim = [{k: v for k, v in r.items() if k != "security"} | {"security_verdict": (r.get("security") or {}).get("verdict")}
+                    for r in it["resources"]]
+            material += ["# Resources found", json.dumps(slim, ensure_ascii=False, indent=1)[:6000]]
         for sk in (it.get("meta") or {}).get("imported_skills") or []:
             material += [f"# Third-party skill file (UNTRUSTED DATA): {sk['repo']}/{sk['path']}", sk["content"]]
         draft = await ai.draft_skill("\n\n".join(material))
         draft["status"] = "pending" if draft.get("worth_it") else "not-worth-it"
         draft["created_at"] = self.db.get(item_id).get("created_at")
+        if draft.get("worth_it"):
+            files = [{"path": f"draft/{draft.get('name') or 'skill'}/SKILL.md", "content": draft.get("skill_md") or ""}]
+            files += [{"path": f"thirdparty/{sk['repo']}/{sk['path']}", "content": sk["content"]}
+                      for sk in (it.get("meta") or {}).get("imported_skills") or []]
+            sec = await security.screen_texts(f"Skill draft '{draft.get('name')}' (+{len(files) - 1} third-party files)", files)
+            draft["security"] = sec
+            if sec["verdict"] == "red":
+                draft["status"] = "blocked"
         self.db.update(item_id, skill_draft=draft)
         if draft.get("worth_it"):
-            msg = (f"🧠 <b>Skill draft ready from #{item_id}: {esc(draft.get('name'))}</b>\n{esc(draft.get('description'))}\n\n"
+            sec = draft["security"]
+            msg = (f"🧠 <b>Skill draft from #{item_id}: {esc(draft.get('name'))}</b> "
+                   f"{security.ICON.get(sec['verdict'], '')}\n{esc(draft.get('description'))}\n\n"
                    f"<i>{esc(draft.get('rationale'))}</i>")
-            if draft.get("safety_notes"):
-                msg += f"\n\n⚠️ {esc(draft['safety_notes'])}"
-            msg += "\n\nTo install: in Claude, say “review my skill inbox”. /skills lists everything waiting."
+            if draft["status"] == "blocked":
+                msg += "\n\n🔴 <b>Blocked from installation.</b> See the security report below."
+            else:
+                msg += "\n\nTo install: in Claude, say “review my skill inbox”. /skills lists everything waiting."
+            await self.tg.send(chat_id, msg, reply_to=mid)
+            msg = security.render(sec, draft.get("name") or "")
         else:
             msg = f"🧠 Looked at #{item_id} for a skill — not worth one: <i>{esc(draft.get('rationale'))}</i>"
         await self.tg.send(chat_id, msg, reply_to=mid)
+
+    async def cmd_security(self, chat_id: int, arg: str) -> None:
+        if not arg.lstrip("#").isdigit():
+            return await self.tg.send(chat_id, "Usage: /security 12")
+        it = self.db.get(int(arg.lstrip("#")))
+        if not it:
+            return await self.tg.send(chat_id, "No item with that number.")
+        reports = [security.render(r["security"], r.get("name") or "") for r in it.get("resources") or [] if r.get("security")]
+        d = it.get("skill_draft") or {}
+        if d.get("security"):
+            reports.append(security.render(d["security"], f"skill draft {d.get('name')}"))
+        if not reports:
+            return await self.tg.send(chat_id, f"Nothing in #{it['id']} has been security-screened yet (no repos or skill drafts).")
+        for rep in reports:
+            await self.tg.send(chat_id, rep)
 
     async def cmd_resources(self, chat_id: int, arg: str) -> None:
         n = int(arg) if arg.isdigit() else 15
@@ -488,8 +539,12 @@ class Hub:
         if not drafts:
             return await self.tg.send(chat_id, "No skill drafts waiting. Use /skill 12 to draft one from an item.")
         lines = ["<b>Skill inbox</b> (review in Claude: “review my skill inbox”)"]
-        lines += [f"🧠 #{it['id']} <b>{esc(it['skill_draft'].get('name'))}</b> — {esc(it['skill_draft'].get('description'))}"
+        lines += [f"🧠 #{it['id']} {security.ICON.get((it['skill_draft'].get('security') or {}).get('verdict'), '')} "
+                  f"<b>{esc(it['skill_draft'].get('name'))}</b> — {esc(it['skill_draft'].get('description'))}"
                   for it in drafts[:20]]
+        blocked = [it for it in self.db.recent(300) if (it.get("skill_draft") or {}).get("status") == "blocked"]
+        if blocked:
+            lines.append(f"\n🔴 {len(blocked)} draft(s) blocked by security screening: " + ", ".join(f"#{b['id']}" for b in blocked[:10]))
         await self.tg.send(chat_id, "\n".join(lines))
 
     @staticmethod
@@ -513,6 +568,9 @@ class Hub:
             bits.append(f"<b>{gh['skill_count']} skill file(s)</b>")
         if r.get("free") and r["free"] != "unknown":
             bits.append(esc(r["free"]))
+        sec = r.get("security") or {}
+        if sec.get("verdict"):
+            head = f"{security.ICON.get(sec['verdict'], '')} " + head
         line = head + (f" — {' · '.join(bits)}" if bits else "")
         if r.get("description"):
             line += f"\n    {esc(r['description'])}"

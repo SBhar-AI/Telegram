@@ -14,6 +14,14 @@
 - DB migration adds resources + skill_draft columns (FTS rebuilt). 7 tests passing.
 - Live bot: @UhuraSRBBot, claimed by the owner. Webhook OK.
 
+## v3 (2026-11-01): security screening in the workflow
+- app/scanner.py (static scan, same rules as tools/scan_skill.py) + app/security.py: pinned-SHA tarball fetch with safe extract
+  (no links, no path escapes, size caps), provenance flags, independent Claude reviewer (security_verdict tool) -> verdict +
+  why + make_safer; the scanner tier sets a floor (HIGH/BLOCK can't be rated green).
+- Wired into GitHub links, resource resolution (max 3 repos/item) and skill drafts (red -> status blocked); /security N;
+  MCP mark_skill_draft refuses red; skill_inbox and list_resources expose verdicts. 9 tests passing.
+- skill-security-screen skill saved by the user (Claude-side fresh review before install).
+
 ## Waiting on Sahil
 - Optional: GITHUB_TOKEN, IG_COOKIES, OPENAI_API_KEY.
 - Connect the MCP URL in Claude Settings → Connectors so the skill inbox can be reviewed.
