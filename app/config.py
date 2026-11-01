@@ -66,6 +66,11 @@ class Settings:
     max_video_mb: int = field(default_factory=lambda: int(_env("MAX_VIDEO_MB", "200")))
     keep_video: bool = field(default_factory=lambda: _env("KEEP_VIDEO", "0") == "1")
 
+    # Resource discovery
+    github_token: str = field(default_factory=lambda: _secret("GITHUB_TOKEN"))  # optional; raises rate limits
+    find_resources: bool = field(default_factory=lambda: _env("FIND_RESOURCES", "1") != "0")
+    max_searches: int = field(default_factory=lambda: int(_env("MAX_SEARCHES", "6")))
+
     # Behaviour
     default_text_action: str = field(default_factory=lambda: _env("DEFAULT_TEXT_ACTION", "note").lower())
 

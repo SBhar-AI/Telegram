@@ -31,33 +31,39 @@ CREATE TABLE IF NOT EXISTS items (
     duration_s REAL,
     media_dir TEXT,
     error TEXT,
-    meta TEXT                        -- JSON
+    meta TEXT,                       -- JSON
+    resources TEXT,                  -- JSON list of resolved resources
+    skill_draft TEXT                 -- JSON skill draft
 );
-
-CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
-    title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category,
-    content='items', content_rowid='id', tokenize='porter unicode61'
-);
-
-CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
-  INSERT INTO items_fts(rowid, title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category)
-  VALUES (new.id, new.title, new.author, new.caption, new.user_note, new.summary, new.transcript, new.key_points, new.techniques, new.tags, new.category);
-END;
-CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN
-  INSERT INTO items_fts(items_fts, rowid, title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category)
-  VALUES ('delete', old.id, old.title, old.author, old.caption, old.user_note, old.summary, old.transcript, old.key_points, old.techniques, old.tags, old.category);
-END;
-CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE ON items BEGIN
-  INSERT INTO items_fts(items_fts, rowid, title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category)
-  VALUES ('delete', old.id, old.title, old.author, old.caption, old.user_note, old.summary, old.transcript, old.key_points, old.techniques, old.tags, old.category);
-  INSERT INTO items_fts(rowid, title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category)
-  VALUES (new.id, new.title, new.author, new.caption, new.user_note, new.summary, new.transcript, new.key_points, new.techniques, new.tags, new.category);
-END;
 
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 """
 
-JSON_FIELDS = ("key_points", "techniques", "tags", "meta")
+FTS_COLS = "title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category, resources"
+
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+    title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category, resources,
+    content='items', content_rowid='id', tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
+  INSERT INTO items_fts(rowid, title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category, resources)
+  VALUES (new.id, new.title, new.author, new.caption, new.user_note, new.summary, new.transcript, new.key_points, new.techniques, new.tags, new.category, new.resources);
+END;
+CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category, resources)
+  VALUES ('delete', old.id, old.title, old.author, old.caption, old.user_note, old.summary, old.transcript, old.key_points, old.techniques, old.tags, old.category, old.resources);
+END;
+CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category, resources)
+  VALUES ('delete', old.id, old.title, old.author, old.caption, old.user_note, old.summary, old.transcript, old.key_points, old.techniques, old.tags, old.category, old.resources);
+  INSERT INTO items_fts(rowid, title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category, resources)
+  VALUES (new.id, new.title, new.author, new.caption, new.user_note, new.summary, new.transcript, new.key_points, new.techniques, new.tags, new.category, new.resources);
+END;
+"""
+
+JSON_FIELDS = ("key_points", "techniques", "tags", "meta", "resources", "skill_draft")
 
 
 def now_iso() -> str:
@@ -72,7 +78,23 @@ class DB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(items)")}
+        for col in ("resources", "skill_draft"):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT")
+        fts_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(items_fts)")}
+        if fts_cols and "resources" not in fts_cols:
+            self._conn.executescript(
+                "DROP TRIGGER IF EXISTS items_ai; DROP TRIGGER IF EXISTS items_ad; DROP TRIGGER IF EXISTS items_au;"
+                "DROP TABLE IF EXISTS items_fts;"
+            )
+        self._conn.executescript(FTS_SCHEMA)
+        if fts_cols and "resources" not in fts_cols:
+            self._conn.execute("INSERT INTO items_fts(items_fts) VALUES('rebuild')")
 
     # ---------- helpers ----------
     def _row(self, r: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -86,7 +108,7 @@ class DB:
                 except (TypeError, ValueError):
                     pass
             else:
-                d[f] = {} if f == "meta" else []
+                d[f] = {} if f in ("meta", "skill_draft") else []
         d["skill_candidate"] = bool(d.get("skill_candidate"))
         return d
 

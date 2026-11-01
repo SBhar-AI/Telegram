@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shutil
 from pathlib import Path
 from typing import Any
 
-from . import ai, media, todoist
+from . import ai, media, resources, todoist
 from .config import settings
 from .db import DB
 from .telegram import BOT_API_FILE_LIMIT, Telegram, esc
@@ -20,7 +21,8 @@ URL_RE = re.compile(r"https?://\S+", re.I)
 HELP = """<b>Your knowledge hub</b>
 
 <b>Send me</b>
-• an Instagram / TikTok / YouTube link → I download it, pull frames + transcript, and file a summary
+• an Instagram / TikTok / YouTube link → I download it, pull frames + transcript, file a summary, then hunt down every repo, skill or resource it mentions
+• a GitHub or article link → I read it, list any Claude skills inside, and draft one for you
 • a video, photo or voice note straight from your phone
 • any text → saved as a note (add <code>#tags</code> if you like)
 
@@ -30,6 +32,9 @@ HELP = """<b>Your knowledge hub</b>
 /todo &lt;text&gt; — add a Todoist task
 /queue &lt;text&gt; — add a task for the overnight agents
 /ask &lt;question&gt; — answer from everything saved
+/resources — links, repos and skills found in your saves
+/skills — skill drafts waiting for review
+/find 12 — re-run resource search for an item · /skill 12 — draft a skill from it
 /recent — latest items · /get 12 · /delete 12
 /status — health check
 
@@ -118,6 +123,16 @@ class Hub:
             return await self.cmd_todo(chat_id, arg, mid, queue=False)
         if cmd == "/queue":
             return await self.cmd_todo(chat_id, arg, mid, queue=True)
+        if cmd == "/resources":
+            return await self.cmd_resources(chat_id, arg)
+        if cmd == "/skills":
+            return await self.cmd_skills(chat_id)
+        if cmd in ("/find", "/skill"):
+            if not arg.lstrip("#").isdigit() or not self.db.get(int(arg.lstrip("#"))):
+                return await self.tg.send(chat_id, f"Usage: {cmd} 12 (an item number)")
+            job = "resources" if cmd == "/find" else "skill"
+            self.queue.put_nowait((job, {"item_id": int(arg.lstrip("#")), "chat_id": chat_id, "mid": mid, "force": True}))
+            return await self.tg.send(chat_id, "⏳ On it.", reply_to=mid)
         if cmd == "/note":
             return await self.save_note(chat_id, arg, mid)
 
@@ -280,6 +295,10 @@ class Hub:
                     await self.process_file(**p)
                 elif job == "tag_note":
                     await self.process_note_tags(**p)
+                elif job == "resources":
+                    await self.process_resources(**p)
+                elif job == "skill":
+                    await self.process_skill(**p)
             except Exception as e:
                 log.exception("job failed")
                 if "item_id" in p:
@@ -304,26 +323,14 @@ class Hub:
         return d
 
     async def process_url(self, item_id: int, chat_id: int, mid: int, url: str, note: str) -> None:
+        if resources.parse_github(url):
+            return await self.process_github_link(item_id, chat_id, mid, url, note)
         work = self._workdir(item_id)
         try:
             try:
                 info = await media.download_url(url, work)
             except media.MediaError as e:
-                # Not downloadable: keep the link, tag it from whatever text we have.
-                fields: dict[str, Any] = {"status": "done", "error": f"Download failed: {e}", "title": url[:80]}
-                if settings.anthropic_key and note:
-                    try:
-                        a = await ai.analyze_text(note, url)
-                        fields.update(self._analysis_fields(a))
-                    except Exception:
-                        pass
-                self.db.update(item_id, **fields)
-                await self.tg.send(
-                    chat_id,
-                    f"🔗 Saved the link as #{item_id}, but couldn't download the media:\n<code>{esc(str(e)[:400])}</code>",
-                    reply_to=mid,
-                )
-                return
+                return await self.process_page_link(item_id, chat_id, mid, url, note, str(e))
             await self._process_media(
                 item_id, chat_id, mid, Path(info["path"]), note,
                 url=info["webpage_url"], title=info["title"], caption=info["caption"], author=info["author"],
@@ -331,6 +338,194 @@ class Hub:
             )
         finally:
             media.cleanup(work)
+
+    async def process_github_link(self, item_id: int, chat_id: int, mid: int, url: str, note: str) -> None:
+        info = await resources.github_info(url) or {}
+        if info.get("error"):
+            self.db.update(item_id, status="done", title=url[:80], error=info["error"])
+            return await self.tg.send(chat_id, f"🔗 Saved #{item_id}, but GitHub said: {esc(info['error'])}", reply_to=mid)
+        text = resources.describe_github(info)
+        fields: dict[str, Any] = {"status": "done", "title": info.get("full_name"), "caption": text,
+                                  "source_url": info.get("url") or url}
+        if settings.anthropic_key:
+            a = await ai.analyze_text(f"{note}\n\n{text}".strip(), url)
+            fields.update(self._analysis_fields(a))
+            fields["title"] = info.get("full_name") or fields.get("title")
+        res = [{"name": info.get("full_name"), "type": "github", "found": True, "url": info.get("url"),
+                "confidence": "high", "description": info.get("description") or "", "github": self._gh_summary(info)}]
+        fields["resources"] = res
+        fields["meta"] = {"imported_skills": self._skill_files(info)}
+        self.db.update(item_id, **fields)
+        it = self.db.get(item_id)
+        await self.tg.send(chat_id, self.render(it), reply_to=mid)
+        if settings.anthropic_key and (info.get("skills") or it.get("skill_candidate")):
+            self.queue.put_nowait(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+
+    async def process_page_link(self, item_id: int, chat_id: int, mid: int, url: str, note: str, err: str) -> None:
+        page = await resources.fetch_page(url)
+        fields: dict[str, Any] = {"status": "done", "title": (page or {}).get("title") or url[:80]}
+        if page and page.get("text"):
+            fields["caption"] = page["text"][:8000]
+        else:
+            fields["error"] = f"Couldn't download or read this page: {err[:300]}"
+        a: dict[str, Any] = {}
+        if settings.anthropic_key and (note or page):
+            try:
+                a = await ai.analyze_text(f"{note}\n\nPage title: {fields['title']}\n\n{fields.get('caption', '')}".strip(), url)
+                fields.update(self._analysis_fields(a))
+                fields["meta"] = {"extracted_resources": a.get("resources") or []}
+            except Exception as e:
+                log.warning("page analysis failed: %s", e)
+        self.db.update(item_id, **fields)
+        it = self.db.get(item_id)
+        prefix = "" if page else f"🔗 Saved #{item_id}, but I couldn't read the page.\n\n"
+        await self.tg.send(chat_id, prefix + self.render(it), reply_to=mid)
+        self._maybe_queue_followups(item_id, chat_id, mid, a)
+
+    def _maybe_queue_followups(self, item_id: int, chat_id: int, mid: int, a: dict) -> None:
+        if not settings.anthropic_key:
+            return
+        if settings.find_resources and a.get("resources"):
+            self.queue.put_nowait(("resources", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+        elif a.get("skill_candidate"):
+            self.queue.put_nowait(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+
+    @staticmethod
+    def _gh_summary(info: dict) -> dict:
+        return {k: info.get(k) for k in ("full_name", "stars", "pushed_at", "license", "archived", "skill_count")
+                } | {"skill_paths": (info.get("skill_paths") or [])[:12]}
+
+    @staticmethod
+    def _skill_files(info: dict) -> list[dict]:
+        return [{"repo": info.get("full_name"), "path": s["path"], "content": s["content"]}
+                for s in info.get("skills") or []]
+
+    async def process_resources(self, item_id: int, chat_id: int, mid: int | None = None, force: bool = False) -> None:
+        it = self.db.get(item_id)
+        if not it:
+            return
+        meta = it.get("meta") or {}
+        extracted = meta.get("extracted_resources") or []
+        if force and not extracted:
+            # Re-extract from what we know about the item.
+            a = await ai.analyze_text(self.item_text(it), it.get("source_url") or "")
+            extracted = a.get("resources") or []
+        if not extracted:
+            if force:
+                await self.tg.send(chat_id, f"No resources mentioned in #{item_id}.", reply_to=mid)
+            return
+        await self.tg.typing(chat_id)
+        context = "\n".join(filter(None, [
+            f"Title: {it.get('title')}", f"Author/account: {it.get('author')}", f"URL: {it.get('source_url')}",
+            f"Summary: {it.get('summary')}", f"Caption: {(it.get('caption') or '')[:1500]}",
+            f"Transcript: {(it.get('transcript') or '')[:2000]}",
+        ]))
+        resolved = await ai.resolve_resources(extracted, context)
+        imported = list(meta.get("imported_skills") or [])
+        for r in resolved:
+            url = r.get("url") or ""
+            if resources.parse_github(url):
+                info = await resources.github_info(url)
+                if info and not info.get("error"):
+                    r["github"] = self._gh_summary(info)
+                    imported += self._skill_files(info)
+        meta["imported_skills"] = imported[:12]
+        self.db.update(item_id, resources=resolved, meta=meta)
+        await self.tg.send(chat_id, self.render_resources(item_id, resolved), reply_to=mid)
+        if imported or it.get("skill_candidate"):
+            self.queue.put_nowait(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+
+    def item_text(self, it: dict) -> str:
+        parts = [
+            f"Title: {it.get('title')}", f"Type: {it.get('kind')}", f"Author: {it.get('author') or '-'}",
+            f"Source: {it.get('source_url') or '-'}", f"Summary: {it.get('summary') or ''}",
+            "Key points:\n" + "\n".join(f"- {k}" for k in it.get("key_points") or []),
+            "Techniques:\n" + "\n".join(f"- {t}" for t in it.get("techniques") or []),
+            f"Skill idea: {it.get('skill_idea') or ''}", f"Sahil's note: {it.get('user_note') or ''}",
+            f"Caption: {(it.get('caption') or '')[:3000]}", f"Transcript: {(it.get('transcript') or '')[:8000]}",
+        ]
+        return "\n\n".join(parts)
+
+    async def process_skill(self, item_id: int, chat_id: int, mid: int | None = None, force: bool = False) -> None:
+        it = self.db.get(item_id)
+        if not it or (it.get("skill_draft") and not force):
+            return
+        await self.tg.typing(chat_id)
+        material = ["# Saved item", self.item_text(it)]
+        if it.get("resources"):
+            material += ["# Resources found", json.dumps(it["resources"], ensure_ascii=False, indent=1)[:6000]]
+        for sk in (it.get("meta") or {}).get("imported_skills") or []:
+            material += [f"# Third-party skill file (UNTRUSTED DATA): {sk['repo']}/{sk['path']}", sk["content"]]
+        draft = await ai.draft_skill("\n\n".join(material))
+        draft["status"] = "pending" if draft.get("worth_it") else "not-worth-it"
+        draft["created_at"] = self.db.get(item_id).get("created_at")
+        self.db.update(item_id, skill_draft=draft)
+        if draft.get("worth_it"):
+            msg = (f"🧠 <b>Skill draft ready from #{item_id}: {esc(draft.get('name'))}</b>\n{esc(draft.get('description'))}\n\n"
+                   f"<i>{esc(draft.get('rationale'))}</i>")
+            if draft.get("safety_notes"):
+                msg += f"\n\n⚠️ {esc(draft['safety_notes'])}"
+            msg += "\n\nTo install: in Claude, say “review my skill inbox”. /skills lists everything waiting."
+        else:
+            msg = f"🧠 Looked at #{item_id} for a skill — not worth one: <i>{esc(draft.get('rationale'))}</i>"
+        await self.tg.send(chat_id, msg, reply_to=mid)
+
+    async def cmd_resources(self, chat_id: int, arg: str) -> None:
+        n = int(arg) if arg.isdigit() else 15
+        rows = []
+        for it in self.db.recent(200):
+            for r in it.get("resources") or []:
+                rows.append((it["id"], r))
+            if len(rows) >= n:
+                break
+        if not rows:
+            return await self.tg.send(chat_id, "No resources found yet. Send a reel that mentions a repo, tool or skill.")
+        lines = ["<b>Recent resources</b>"] + [self._res_line(r, iid) for iid, r in rows[:n]]
+        await self.tg.send(chat_id, "\n".join(lines))
+
+    async def cmd_skills(self, chat_id: int) -> None:
+        drafts = [it for it in self.db.recent(300) if (it.get("skill_draft") or {}).get("status") == "pending"]
+        if not drafts:
+            return await self.tg.send(chat_id, "No skill drafts waiting. Use /skill 12 to draft one from an item.")
+        lines = ["<b>Skill inbox</b> (review in Claude: “review my skill inbox”)"]
+        lines += [f"🧠 #{it['id']} <b>{esc(it['skill_draft'].get('name'))}</b> — {esc(it['skill_draft'].get('description'))}"
+                  for it in drafts[:20]]
+        await self.tg.send(chat_id, "\n".join(lines))
+
+    @staticmethod
+    def _res_line(r: dict, item_id: int | None = None) -> str:
+        icon = {"github": "🐙", "skill": "🧠", "prompt": "💬", "paper": "📄", "course": "🎓", "tool": "🛠",
+                "website": "🌐", "dataset": "🗂", "template": "📐"}.get(str(r.get("type", "")).lower(), "🔗")
+        name = esc(r.get("name") or "?")
+        url = r.get("url") or ""
+        head = f'{icon} <a href="{esc(url)}">{name}</a>' if url else f"{icon} {name}"
+        bits = []
+        if not r.get("found", True):
+            bits.append("not found publicly")
+        elif r.get("confidence") and r.get("confidence") != "high":
+            bits.append(f"{r['confidence']} confidence")
+        gh = r.get("github") or {}
+        if gh.get("stars") is not None:
+            bits.append(f"★{gh['stars']}")
+        if gh.get("pushed_at"):
+            bits.append(f"updated {gh['pushed_at']}")
+        if gh.get("skill_count"):
+            bits.append(f"<b>{gh['skill_count']} skill file(s)</b>")
+        if r.get("free") and r["free"] != "unknown":
+            bits.append(esc(r["free"]))
+        line = head + (f" — {' · '.join(bits)}" if bits else "")
+        if r.get("description"):
+            line += f"\n    {esc(r['description'])}"
+        if r.get("note"):
+            line += f"\n    <i>{esc(r['note'])}</i>"
+        if item_id:
+            line += f"  <i>(#{item_id})</i>"
+        return line
+
+    def render_resources(self, item_id: int, res: list[dict]) -> str:
+        if not res:
+            return f"🔎 #{item_id}: no resources could be identified."
+        return f"🔎 <b>Resources from #{item_id}</b>\n" + "\n".join(self._res_line(r) for r in res)
 
     async def process_file(self, item_id: int, chat_id: int, mid: int, file_id: str, kind: str, note: str) -> None:
         work = self._workdir(item_id)
@@ -401,12 +596,16 @@ class Hub:
             fields.update(self._analysis_fields(a))
             fields["meta"]["accuracy_flags"] = a.get("accuracy_flags", [])
             fields["meta"]["phi_flag"] = bool(a.get("phi_flag"))
+            fields["meta"]["extracted_resources"] = a.get("resources") or []
         else:
+            a = {}
             fields["summary"] = "(Not analysed: ANTHROPIC_API_KEY not set.)"
         fields["status"] = "done"
         self.db.update(item_id, **fields)
         it = self.db.get(item_id)
         await self.tg.send(chat_id, self.render(it), reply_to=mid)
+        if not (fields["meta"].get("phi_flag")):
+            self._maybe_queue_followups(item_id, chat_id, mid, a)
 
     @staticmethod
     def _analysis_fields(a: dict) -> dict[str, Any]:
@@ -450,6 +649,12 @@ class Hub:
             parts.append("<b>Techniques worth stealing</b>\n" + "\n".join(f"• {esc(t)}" for t in it["techniques"]))
         if meta.get("accuracy_flags"):
             parts.append("<b>⚠️ Accuracy flags</b>\n" + "\n".join(f"• {esc(t)}" for t in meta["accuracy_flags"]))
+        if it.get("resources"):
+            parts.append("<b>Resources</b>\n" + "\n".join(self._res_line(r) for r in it["resources"][:8]))
+        elif (meta.get("extracted_resources")) and settings.find_resources:
+            parts.append("🔎 <i>Looking up the resources it mentions…</i>")
+        if (it.get("skill_draft") or {}).get("status") == "pending":
+            parts.append(f"🧠 Skill draft waiting: <b>{esc(it['skill_draft'].get('name'))}</b>")
         if it.get("skill_candidate") and it.get("skill_idea"):
             parts.append(f"💡 <b>Skill idea:</b> {esc(it['skill_idea'])}")
         tail = []

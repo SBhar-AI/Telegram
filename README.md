@@ -8,9 +8,18 @@ Phone ──Telegram──▶ /telegram/webhook ──▶ queue ──▶ yt-dlp
                                                   ├─ Whisper: transcript
                                                   ├─ Claude: summary, key points, techniques, tags, skill idea
                                                   └─ SQLite + FTS5 on /data volume
-Claude / ChatGPT ──MCP──▶ /s/<MCP_SECRET>/mcp  (search · fetch · get_frames · list_recent · add_note · list_skill_candidates)
+Claude / ChatGPT ──MCP──▶ /s/<MCP_SECRET>/mcp  (search · fetch · get_frames · list_recent · add_note · list_skill_candidates ·
+                                                 list_resources · skill_inbox · get_skill_draft · mark_skill_draft)
 Browser ──▶ /view/<MCP_SECRET>/item/<id>       (private read-only item page)
 ```
+
+## The loop: see it → send it → strengthen Claude
+
+1. You send a reel/video/link to **@UhuraSRBBot**.
+2. It is analysed (frames + transcript + caption): summary, key points, reusable techniques.
+3. **Resources** it mentions, shows or advertises (GitHub repos, Claude skills, prompts, tools, papers, "comment X to get it", "link in bio") are extracted and **resolved with web search** to real public links. GitHub repos are checked for stars, last update, license and **SKILL.md files**, which are pulled in.
+4. If there is something skill-worthy, a **skill draft** (a complete SKILL.md tailored to Sahil) is written and placed in the **skill inbox**.
+5. In Claude, say "review my skill inbox". Claude reads the draft through the connector, critiques it, and shows it as a skill card you can save. Third-party skill content is treated as untrusted and flagged.
 
 ## What you can send
 
@@ -19,7 +28,10 @@ Browser ──▶ /view/<MCP_SECRET>/item/<id>       (private read-only item pag
 | Instagram / TikTok / YouTube / X link (+ optional note) | Downloads it, takes 4–16 frames, transcribes it, analyses it, and replies with a summary |
 | A video or photo from your camera roll (up to 20 MB) | Same pipeline as a link |
 | A voice note | Transcribed. If it starts with "todo …" it goes to Todoist; if it starts with "queue …" it goes to the overnight agents; anything else is saved as a note |
+| A GitHub link | Reads the repo (README, stars, license), lists its Claude skills, and drafts a skill for you |
+| An article / web link | Reads the page, summarises it, and finds the resources it mentions |
 | Plain text | Saved as a note. `#tags` are picked up |
+| `/resources`, `/skills`, `/find N`, `/skill N` | Browse found resources, see the skill inbox, re-run resource search, or force a skill draft |
 | `/todo`, `/queue`, `/ask`, `/recent`, `/get N`, `/delete N`, `/status` | See `/help` in the bot |
 
 No patient information should go through this bot. The analyser flags anything that looks like PHI.
@@ -39,6 +51,9 @@ No patient information should go through this bot. The analyser flags anything t
 | `IG_COOKIES` | recommended | Netscape `cookies.txt` contents from a logged-in **burner** Instagram account. Without it, Instagram often blocks downloads |
 | `MCP_SECRET` | yes | Already set. It is part of the connector URL, so treat that URL like a password |
 | `TELEGRAM_ALLOWED_USER_IDS` | no | An alternative to claiming: a comma-separated list of Telegram user IDs |
+| `GITHUB_TOKEN` | no | A read-only GitHub token. It raises the GitHub API limit from 60 to 5,000 requests an hour |
+| `FIND_RESOURCES` | no | `1` (default) looks up resources automatically. `0` makes it on-demand only (`/find N`) |
+| `MAX_SEARCHES` | no | Maximum web searches per item (default 6, at about $0.01 per search) |
 | `DEFAULT_TEXT_ACTION` | no | `note` (default) or `todo` |
 | `KEEP_VIDEO` | no | `1` keeps the original video files. By default only the frames are kept, to save space |
 
