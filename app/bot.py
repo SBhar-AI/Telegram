@@ -499,7 +499,9 @@ class Hub:
     def _maybe_queue_followups(self, item_id: int, chat_id: int, mid: int, a: dict) -> None:
         if not settings.anthropic_key:
             return
-        if settings.find_resources and a.get("resources"):
+        it = self.db.get(item_id) or {}
+        slugs = resources.find_slugs(self.item_text(it)) if it else []
+        if settings.find_resources and (a.get("resources") or slugs):
             self.enqueue(("resources", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
         elif a.get("skill_candidate"):
             self.enqueue(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
@@ -520,11 +522,13 @@ class Hub:
             return
         meta = it.get("meta") or {}
         extracted = meta.get("extracted_resources") or []
-        if force and not extracted:
+        if not extracted and resources.find_slugs(self.item_text(it)):
+            extracted = []  # repo slugs in the post are resolved directly below
+        elif force and not extracted:
             # Re-extract from what we know about the item.
             a = await ai.analyze_text(self.item_text(it), it.get("source_url") or "")
             extracted = a.get("resources") or []
-        if not extracted:
+        if not extracted and not resources.find_slugs(self.item_text(it)):
             if force:
                 await self.tg.send(chat_id, f"No resources mentioned in #{item_id}.", reply_to=mid)
             return

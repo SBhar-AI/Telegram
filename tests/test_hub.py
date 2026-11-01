@@ -499,3 +499,16 @@ def test_exact_repo_beats_generic_search(monkeypatch):
     assert mp["found"] is False and mp["url"] == "" and "docs.claude.com" in mp["lead"]  # generic page demoted to lead
     msg = next(m for m in SENT if "Resources from #" in m)
     assert "wheresryan22/anatomy" in msg and "Exact link not found" in msg and "comment SKILLS" in msg
+
+
+def test_slugs_trigger_lookup_even_if_analysis_lists_none(monkeypatch):
+    iid = db.create("video", status="done", title="skills reel", key_points=["Anatomy (wheresryan22/anatomy)"],
+                    meta={"extracted_resources": []})
+    hub._maybe_queue_followups(iid, OWNER, None, {"resources": [], "skill_candidate": False})
+    job, p = hub.queue.get_nowait()
+    assert job == "resources"
+
+    async def go():
+        await hub.process_resources(**p)
+    asyncio.run(go())
+    assert db.get(iid)["resources"][0]["url"] == "https://github.com/wheresryan22/anatomy"
