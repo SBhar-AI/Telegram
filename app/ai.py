@@ -177,21 +177,7 @@ ANALYSIS_TOOL = {
 }
 
 
-async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000, tool: dict | None = None) -> str:
-    """Call Claude. With `tool`, force that tool and return its input as a JSON string."""
-    if not settings.anthropic_key:
-        raise AIError("ANTHROPIC_API_KEY is not set.")
-    if isinstance(content, str):
-        content = [{"type": "text", "text": content}]
-    body = {
-        "model": settings.claude_model,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": [{"role": "user", "content": content}],
-    }
-    if tool:
-        body["tools"] = [tool]
-        body["tool_choice"] = {"type": "tool", "name": tool["name"]}
+async def _post(body: dict) -> dict:
     headers = {
         "x-api-key": settings.anthropic_key,
         "anthropic-version": "2023-06-01",
@@ -204,14 +190,41 @@ async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000,
             continue
         if r.status_code >= 400:
             raise AIError(f"Claude API {r.status_code}: {r.text[:300]}")
-        data = r.json()
-        if tool:
-            for b in data.get("content", []):
-                if b.get("type") == "tool_use":
-                    return json.dumps(b.get("input", {}))
-            log.warning("no tool_use block; stop_reason=%s", data.get("stop_reason"))
-        return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+        return r.json()
     raise AIError("Claude API unavailable after retries.")
+
+
+async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000, tool: dict | None = None) -> str:
+    """Call Claude. With `tool`, ask for that tool and return its input as a JSON string.
+
+    Some current models reject a forced tool_choice, so we use tool_choice=auto plus an explicit instruction,
+    nudge once if the model answers in prose, and finally fall back to JSON in the text."""
+    if not settings.anthropic_key:
+        raise AIError("ANTHROPIC_API_KEY is not set.")
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    messages: list[dict] = [{"role": "user", "content": content}]
+    body: dict[str, Any] = {"model": settings.claude_model, "max_tokens": max_tokens, "system": system, "messages": messages}
+    if tool:
+        body["system"] = system + f"\n\nYou must respond by calling the `{tool['name']}` tool exactly once."
+        body["tools"] = [tool]
+        body["tool_choice"] = {"type": "auto"}
+    texts: list[str] = []
+    for _ in range(3 if tool else 1):
+        data = await _post(body)
+        blocks = data.get("content", [])
+        if tool:
+            for b in blocks:
+                if b.get("type") == "tool_use" and b.get("name") == tool["name"]:
+                    return json.dumps(b.get("input", {}))
+        text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+        texts.append(text)
+        if not tool:
+            return text
+        log.warning("no %s call (stop_reason=%s); nudging", tool["name"], data.get("stop_reason"))
+        messages.append({"role": "assistant", "content": blocks or [{"type": "text", "text": "(no answer)"}]})
+        messages.append({"role": "user", "content": f"Call the {tool['name']} tool now with your answer."})
+    return "\n".join(t for t in texts if t)
 
 
 def parse_json(text: str) -> dict[str, Any]:

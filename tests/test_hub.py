@@ -18,6 +18,7 @@ os.environ.update({
 from app import ai, bot, media, resources, security, todoist
 import shutil  # noqa: E402
 from app.main import app, db, hub  # noqa: E402
+ORIG_CLAUDE = ai.claude
 
 SENT: list[str] = []
 OWNER = 555
@@ -340,3 +341,38 @@ def test_http_endpoints_and_mcp():
         lr = json.loads(rpc("tools/call", {"name": "list_resources", "arguments": {"type": "github"}}, 9)["content"][0]["text"])
         assert lr and lr[0]["url"].startswith("https://github.com/")
         assert c.post("/s/wrong/mcp", headers=h, json={}).status_code == 404
+
+
+def test_claude_tool_nudge(monkeypatch):
+    """Model answers in prose first (forced tool_choice unsupported) -> we nudge and get the tool call."""
+    from app import ai as ai_mod
+    calls = []
+
+    async def fake_post(body):
+        calls.append(body)
+        assert body["tool_choice"] == {"type": "auto"}
+        if len(calls) == 1:
+            return {"content": [{"type": "text", "text": "Here is my analysis..."}], "stop_reason": "end_turn"}
+        return {"content": [{"type": "tool_use", "name": "save_analysis", "input": {"title": "ok"}}], "stop_reason": "tool_use"}
+
+    monkeypatch.setattr(ai_mod, "_post", fake_post)
+    monkeypatch.setattr(ai_mod.settings, "anthropic_key", "k")
+    out = asyncio.run(ORIG_CLAUDE("sys", "hi", tool=ai_mod.ANALYSIS_TOOL))
+    assert json.loads(out)["title"] == "ok" and len(calls) == 2
+    assert calls[1]["messages"][-1]["content"].startswith("Call the save_analysis tool")
+
+
+def test_retry_failed(monkeypatch):
+    async def fake_download(url, work):
+        p = make_video(work / "source.mp4")
+        return {"path": str(p), "title": "reel", "caption": "", "author": "x", "duration": 12,
+                "webpage_url": url, "extractor": "Instagram", "upload_date": ""}
+    monkeypatch.setattr(media, "download_url", fake_download)
+    iid = db.create("link", status="error", error="Claude API 400", source_url="https://www.instagram.com/reel/RETRY/")
+
+    async def go():
+        await hub.handle_update(upd("/retry failed"))
+        assert "Re-running" in SENT[-1]
+        await drain()
+    asyncio.run(go())
+    assert db.get(iid)["status"] == "done" and db.get(iid)["kind"] == "video"

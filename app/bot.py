@@ -36,6 +36,7 @@ HELP = """<b>Your knowledge hub</b>
 /skills — skill drafts waiting for review
 /find 12 — re-run resource search for an item · /skill 12 — draft a skill from it
 /security 12 — full security report (why + how to make it safer)
+/retry 12 — re-run a failed item · /retry failed — re-run every failed item
 /recent — latest items · /get 12 · /delete 12
 /status — health check
 
@@ -126,6 +127,8 @@ class Hub:
             return await self.cmd_todo(chat_id, arg, mid, queue=True)
         if cmd == "/resources":
             return await self.cmd_resources(chat_id, arg)
+        if cmd == "/retry":
+            return await self.cmd_retry(chat_id, arg, mid)
         if cmd == "/security":
             return await self.cmd_security(chat_id, arg)
         if cmd == "/skills":
@@ -505,6 +508,31 @@ class Hub:
         else:
             msg = f"🧠 Looked at #{item_id} for a skill — not worth one: <i>{esc(draft.get('rationale'))}</i>"
         await self.tg.send(chat_id, msg, reply_to=mid)
+
+    async def cmd_retry(self, chat_id: int, arg: str, mid: int) -> None:
+        if arg.strip().lower() == "failed":
+            targets = [it for it in self.db.recent(100) if it["status"] == "error"]
+        elif arg.lstrip("#").isdigit() and self.db.get(int(arg.lstrip("#"))):
+            targets = [self.db.get(int(arg.lstrip("#")))]
+        else:
+            return await self.tg.send(chat_id, "Usage: /retry 12  or  /retry failed")
+        n = 0
+        for it in targets:
+            fid = (it.get("meta") or {}).get("telegram_file_id")
+            note = it.get("user_note") or ""
+            if it.get("source_url"):
+                self.db.update(it["id"], status="processing", error=None, kind="link")
+                self.queue.put_nowait(("url", {"item_id": it["id"], "chat_id": chat_id, "mid": mid,
+                                               "url": it["source_url"], "note": note}))
+            elif fid:
+                kind = it["kind"] if it["kind"] in ("video", "image", "voice") else "video"
+                self.db.update(it["id"], status="processing", error=None)
+                self.queue.put_nowait(("file", {"item_id": it["id"], "chat_id": chat_id, "mid": mid,
+                                                "file_id": fid, "kind": kind, "note": note}))
+            else:
+                continue
+            n += 1
+        await self.tg.send(chat_id, f"🔁 Re-running {n} item(s)." if n else "Nothing to retry.", reply_to=mid)
 
     async def cmd_security(self, chat_id: int, arg: str) -> None:
         if not arg.lstrip("#").isdigit():
