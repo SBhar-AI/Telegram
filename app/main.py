@@ -135,7 +135,7 @@ async def refind(secret: str, item_id: int):
 
 
 @app.get("/view/{secret}/item/{item_id}/dump")
-async def dump(secret: str, item_id: int):
+async def dump(secret: str, item_id: int, part: str = "all"):
     """Write an item's exact skill draft + third-party skill files to the server log (base64 chunks), so they can be
     read verbatim via the Railway log API for an independent security review."""
     import base64
@@ -144,8 +144,12 @@ async def dump(secret: str, item_id: int):
     it = db.get(item_id)
     if not it:
         raise HTTPException(status_code=404)
-    payload = _json.dumps({"skill_draft": it.get("skill_draft") or {},
-                           "imported_skills": (it.get("meta") or {}).get("imported_skills") or []}, ensure_ascii=False)
+    d = it.get("skill_draft") or {}
+    if part == "skill_md":
+        payload = d.get("skill_md") or ""
+    else:
+        payload = _json.dumps({"skill_draft": d,
+                               "imported_skills": (it.get("meta") or {}).get("imported_skills") or []}, ensure_ascii=False)
     b = base64.b64encode(payload.encode()).decode()
     chunks = [b[i:i + 3000] for i in range(0, len(b), 3000)]
     for i, c in enumerate(chunks):
