@@ -134,6 +134,25 @@ async def refind(secret: str, item_id: int):
     return {"queued": item_id}
 
 
+@app.get("/view/{secret}/item/{item_id}/dump")
+async def dump(secret: str, item_id: int):
+    """Write an item's exact skill draft + third-party skill files to the server log (base64 chunks), so they can be
+    read verbatim via the Railway log API for an independent security review."""
+    import base64
+    import json as _json
+    _check_secret(secret)
+    it = db.get(item_id)
+    if not it:
+        raise HTTPException(status_code=404)
+    payload = _json.dumps({"skill_draft": it.get("skill_draft") or {},
+                           "imported_skills": (it.get("meta") or {}).get("imported_skills") or []}, ensure_ascii=False)
+    b = base64.b64encode(payload.encode()).decode()
+    chunks = [b[i:i + 3000] for i in range(0, len(b), 3000)]
+    for i, c in enumerate(chunks):
+        log.info("DUMP%d %d/%d %s", item_id, i + 1, len(chunks), c)
+    return {"item": item_id, "chunks": len(chunks)}
+
+
 @app.get("/view/{secret}/item/{item_id}/frame/{n}")
 async def view_frame(secret: str, item_id: int, n: int):
     _check_secret(secret)
