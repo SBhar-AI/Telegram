@@ -412,7 +412,10 @@ class Hub:
             if pending and it["status"] == "error" and str(it.get("error", "")).startswith("Interrupted"):
                 self.db.update(it["id"], status="processing", error=None)
             # Orphans: created as "processing" but never queued (e.g. #62 on 2026-11-04). Re-queue link saves.
-            if not pending and it["status"] == "processing" and it.get("source_url") and not it.get("summary"):
+            # (mark_interrupted runs first at startup, so these arrive as status=error "Interrupted…".)
+            interrupted = it["status"] == "error" and str(it.get("error", "")).startswith("Interrupted")
+            if not pending and interrupted and it.get("source_url") and not it.get("summary"):
+                self.db.update(it["id"], status="processing", error=None)
                 owners = sorted(self.owner_ids())
                 if owners:
                     self.enqueue(("url", {"item_id": it["id"], "chat_id": owners[0], "mid": None,
