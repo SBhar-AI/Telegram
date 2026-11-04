@@ -271,9 +271,10 @@ class Hub:
     # ------------------------------------------------------------------ queueing
     async def enqueue_url(self, chat_id: int, mid: int, url: str, note: str) -> None:
         item_id = self.db.create("link", status="processing", source_url=url, user_note=note)
+        # Queue first, acknowledge second: a failed acknowledgement must never lose the save.
+        self.enqueue(("url", {"item_id": item_id, "chat_id": chat_id, "mid": mid, "url": url, "note": note}))
         await self.tg.react(chat_id, mid)
         await self.tg.send(chat_id, f"⏳ Got it (#{item_id}). Downloading and analysing…", reply_to=mid)
-        self.enqueue(("url", {"item_id": item_id, "chat_id": chat_id, "mid": mid, "url": url, "note": note}))
 
     async def enqueue_file(self, chat_id: int, mid: int, f: dict, kind: str, note: str) -> None:
         size = int(f.get("file_size") or 0)
@@ -286,12 +287,12 @@ class Hub:
             )
             return
         item_id = self.db.create(kind, status="processing", user_note=note, meta={"telegram_file_id": f["file_id"]})
-        await self.tg.react(chat_id, mid)
-        if kind != "voice":
-            await self.tg.send(chat_id, f"⏳ Got it (#{item_id}). Analysing…", reply_to=mid)
         self.enqueue(
             ("file", {"item_id": item_id, "chat_id": chat_id, "mid": mid, "file_id": f["file_id"], "kind": kind, "note": note})
         )
+        await self.tg.react(chat_id, mid)
+        if kind != "voice":
+            await self.tg.send(chat_id, f"⏳ Got it (#{item_id}). Analysing…", reply_to=mid)
 
     # ------------------------------------------------------------------ jobs, retries, resume
     ITEM_JOBS = ("url", "file")  # jobs that own the item's status
@@ -410,6 +411,13 @@ class Hub:
                 n += 1
             if pending and it["status"] == "error" and str(it.get("error", "")).startswith("Interrupted"):
                 self.db.update(it["id"], status="processing", error=None)
+            # Orphans: created as "processing" but never queued (e.g. #62 on 2026-11-04). Re-queue link saves.
+            if not pending and it["status"] == "processing" and it.get("source_url") and not it.get("summary"):
+                owners = sorted(self.owner_ids())
+                if owners:
+                    self.enqueue(("url", {"item_id": it["id"], "chat_id": owners[0], "mid": None,
+                                          "url": it["source_url"], "note": it.get("user_note") or ""}))
+                    n += 1
         return n
 
     async def cmd_failed(self, chat_id: int) -> None:

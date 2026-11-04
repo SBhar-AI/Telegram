@@ -525,3 +525,23 @@ def test_slugs_trigger_lookup_even_if_analysis_lists_none(monkeypatch):
         await hub.process_resources(**p)
     asyncio.run(go())
     assert db.get(iid)["resources"][0]["url"] == "https://github.com/wheresryan22/anatomy"
+
+
+def test_telegram_network_error_does_not_raise():
+    import asyncio, httpx
+    from app.telegram import Telegram, split_html
+    tg = Telegram("123:abc")
+    def boom(request):
+        raise httpx.ConnectError("tls failed")
+    tg.client = httpx.AsyncClient(transport=httpx.MockTransport(boom))
+    import app.telegram as T
+    orig = T.asyncio.sleep
+    async def nosleep(_): return None
+    T.asyncio.sleep = nosleep
+    try:
+        assert asyncio.run(tg.react(1, 2)) is None
+    finally:
+        T.asyncio.sleep = orig
+    long = "\n".join(f"<b>row {i}</b> <i>{'y' * 200}</i>" for i in range(40))
+    chunks = split_html(long)
+    assert len(chunks) > 1 and all(len(c) <= 4096 and c.count("<b>") == c.count("</b>") and c.count("<i>") == c.count("</i>") for c in chunks)
