@@ -34,6 +34,7 @@ Browser ──▶ /view/<MCP_SECRET>/item/<id>       (private read-only item pag
 | Plain text | Saved as a note. `#tags` are picked up |
 | `/failed`, `/retry N`, `/retry failed` | Failed jobs retry automatically: 3 attempts, 30 s and then 2 min apart. Only after the 3rd failure do you get one message listing all 3 errors, and the item appears in `/failed` for you to review. Jobs that a restart interrupted resume on their own. |
 | `/resources`, `/skills`, `/find N`, `/skill N` | Browse found resources, see the skill inbox, re-run resource search, or force a skill draft |
+| `/retry photos` | Re-read Instagram photo/carousel posts saved before photo support (slides are now read as images) |
 | `/todo`, `/queue`, `/ask`, `/recent`, `/get N`, `/delete N`, `/status` | See `/help` in the bot |
 
 No patient information should go through this bot. The analyser flags anything that looks like PHI.

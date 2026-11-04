@@ -35,6 +35,15 @@
   (each item the video covers: what it does, link, stars, verdict + safer path; For you; skill draft; caveats).
 - Debug: /view/<secret>/json/<id> and /view/<secret>/item/<id>/refind (use a cache-busting query when fetching).
 
+## v6 (2026-11-04): reliability + Instagram photo posts
+- Telegram calls retry network errors/429 and never crash handlers; saves are queued before the ack; orphaned
+  "processing" link saves are re-queued on restart; long HTML replies split with balanced tags.
+- Photo/carousel posts: yt-dlp fails on these, and the old page fallback only saw Instagram's login wall. Now
+  media.instagram_photos() gets the slide images (IG media API if IG_COOKIES set -> embed page -> og:image preview)
+  and they're analysed slide by slide. /retry photos re-reads old Instagram posts that never had images read.
+- Known gap: a carousel whose first slide is a video is still handled by yt-dlp as that one video (other slides skipped).
+- 20 tests passing.
+
 ## Waiting on Sahil
 - Optional: GITHUB_TOKEN, IG_COOKIES, OPENAI_API_KEY.
 - Connect the MCP URL in Claude Settings → Connectors so the skill inbox can be reviewed.

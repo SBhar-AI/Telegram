@@ -265,6 +265,8 @@ async def analyze(
         if kind == "video" and duration:
             t = duration * (i + 0.5) / len(frames)
             content.append({"type": "text", "text": f"Frame {i + 1} at {t:.1f}s"})
+        elif kind == "image" and len(frames) > 1:
+            content.append({"type": "text", "text": f"Slide {i + 1} of {len(frames)} (read any text on it carefully)"})
         content.append(_img_block(f))
     ctx = [
         f"Content type: {kind}",

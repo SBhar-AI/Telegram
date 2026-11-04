@@ -453,6 +453,21 @@ class Hub:
             try:
                 info = await media.download_url(url, work)
             except media.MediaError as e:
+                if media.instagram_shortcode(url):  # photo / carousel post: get the images instead of the page
+                    try:
+                        ph = await media.instagram_photos(url, work)
+                    except media.MediaError as pe:
+                        log.info("instagram photos #%d: %s", item_id, pe)
+                        return await self.process_page_link(item_id, chat_id, mid, url, note, f"{e}; {pe}")
+                    log.info("instagram photos #%d: %d of %d slide(s) via %s", item_id, len(ph["paths"]),
+                             ph["total_slides"], ph["source"])
+                    return await self._process_media(
+                        item_id, chat_id, mid, ph["paths"][0], note, url=ph["webpage_url"], title="",
+                        caption=ph["caption"], author=ph["author"], force_kind="image", images=ph["paths"],
+                        meta={"extractor": "Instagram photos", "slides": len(ph["paths"]),
+                              "total_slides": ph["total_slides"], "video_slides": ph["video_slides"],
+                              "photo_source": ph["source"]},
+                    )
                 return await self.process_page_link(item_id, chat_id, mid, url, note, str(e))
             await self._process_media(
                 item_id, chat_id, mid, Path(info["path"]), note,
@@ -742,20 +757,27 @@ class Hub:
         return "\n\n".join(parts)
 
     async def cmd_retry(self, chat_id: int, arg: str, mid: int) -> None:
-        if arg.strip().lower() == "failed":
+        if arg.strip().lower() == "photos":  # Instagram posts saved before photo support: images never read
+            targets = [it for it in self.db.recent(1000) if it.get("kind") == "link"
+                       and media.instagram_shortcode(it.get("source_url") or "") and not (it.get("meta") or {}).get("frames")]
+            if not targets:
+                return await self.tg.send(chat_id, "✅ No Instagram photo posts waiting to be re-read.")
+        elif arg.strip().lower() == "failed":
             targets = [it for it in self.db.recent(300)
                        if it["status"] == "error" or (it.get("meta") or {}).get("needs_attention")]
         elif arg.lstrip("#").isdigit() and self.db.get(int(arg.lstrip("#"))):
             targets = [self.db.get(int(arg.lstrip("#")))]
         else:
-            return await self.tg.send(chat_id, "Usage: /retry 12  or  /retry failed")
+            return await self.tg.send(chat_id, "Usage: /retry 12  ·  /retry failed  ·  /retry photos")
         n = 0
         for it in targets:
             meta = it.get("meta") or {}
             meta.pop("needs_attention", None)
             meta["attempts"] = {}
             self.db.update(it["id"], meta=meta)
-            if it["status"] != "error":  # item itself fine: a follow-up job failed (resources / skill)
+            redo_photo = (it.get("kind") == "link" and media.instagram_shortcode(it.get("source_url") or "")
+                          and not (it.get("meta") or {}).get("frames"))
+            if it["status"] != "error" and not redo_photo:  # item itself fine: a follow-up job failed (resources / skill)
                 last = next((x["job"] for x in reversed(meta.get("errors") or []) if x["job"] in ("resources", "skill")), None)
                 if last:
                     self.enqueue((last, {"item_id": it["id"], "chat_id": chat_id, "mid": mid, "force": True}))
@@ -897,13 +919,20 @@ class Hub:
 
     async def _process_media(
         self, item_id: int, chat_id: int, mid: int, path: Path, note: str, *, url: str, title: str,
-        caption: str, author: str, meta: dict, force_kind: str | None = None,
+        caption: str, author: str, meta: dict, force_kind: str | None = None, images: list[Path] | None = None,
     ) -> None:
         work = path.parent
         mdir = self._mediadir(item_id)
         kind = force_kind or "video"
         if kind == "image":
-            frames = [await media.image_to_jpeg(path, mdir / "frame_00.jpg")]
+            frames = []
+            for i, img in enumerate(images or [path]):
+                try:
+                    frames.append(await media.image_to_jpeg(img, mdir / f"frame_{i:02d}.jpg"))
+                except media.MediaError as e:
+                    log.info("slide %d unreadable: %s", i, e)
+            if not frames:
+                raise media.MediaError("None of the images could be read.")
             duration, transcript, backend = None, "", "n/a"
         else:
             pr = await media.probe(path)
@@ -924,6 +953,7 @@ class Hub:
             "kind": kind, "source_url": url or None, "title": title[:200] or None, "caption": caption or None,
             "author": author or None, "duration_s": duration, "transcript": transcript or None,
             "media_dir": str(mdir), "meta": self._meta(item_id) | {**meta, "transcriber": backend, "frames": len(frames)},
+            "error": None,
         }
         if settings.anthropic_key:
             a = await ai.analyze(kind=kind, frames=frames, transcript=transcript, caption=caption, title=title,

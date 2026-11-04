@@ -252,6 +252,10 @@ def test_failed_download_keeps_link(monkeypatch):
         return None
     monkeypatch.setattr(resources, "fetch_page", nopage)
 
+    async def nophotos(url, work, client=None):
+        raise media.MediaError("photos blocked")
+    monkeypatch.setattr(media, "instagram_photos", nophotos)
+
     async def go():
         await hub.handle_update(upd("/save https://www.instagram.com/p/XYZ/ check this"))
         await drain()
@@ -545,3 +549,72 @@ def test_telegram_network_error_does_not_raise():
     long = "\n".join(f"<b>row {i}</b> <i>{'y' * 200}</i>" for i in range(40))
     chunks = split_html(long)
     assert len(chunks) > 1 and all(len(c) <= 4096 and c.count("<b>") == c.count("</b>") and c.count("<i>") == c.count("</i>") for c in chunks)
+
+
+def test_instagram_photo_carousel_via_embed(tmp_path):
+    import asyncio, json, httpx
+    from app import media
+    assert media.instagram_shortcode("https://www.instagram.com/p/DfHzIYFy-WC/?igsh=x") == "DfHzIYFy-WC"
+    assert media.instagram_shortcode("https://www.instagram.com/someone/reel/ABC123/") == "ABC123"
+    assert media.shortcode_to_media_id("B") == 1
+    ctx = {"gql_data": {"shortcode_media": {
+        "owner": {"username": "dev_tips"},
+        "edge_media_to_caption": {"edges": [{"node": {"text": "3 repos you need: owner/repo-one"}}]},
+        "edge_sidecar_to_children": {"edges": [{"node": {"display_url": f"https://cdn.example/s{i}.jpg"}} for i in range(3)]}}}}
+    page = '<script>window.x={"contextJSON":' + json.dumps(json.dumps(ctx)) + '}</script>'
+    jpeg = b"\xff\xd8\xff\xe0" + b"0" * 500
+    def handler(req):
+        if "/embed/" in req.url.path:
+            return httpx.Response(200, text=page)
+        if req.url.host == "cdn.example":
+            return httpx.Response(200, content=jpeg, headers={"content-type": "image/jpeg"})
+        return httpx.Response(404)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    res = asyncio.run(media.instagram_photos("https://www.instagram.com/p/DfHzIYFy-WC/", tmp_path, client=client))
+    assert len(res["paths"]) == 3 and res["author"] == "dev_tips" and "owner/repo-one" in res["caption"]
+    assert res["source"] == "embed"
+
+
+def test_instagram_photo_falls_back_to_preview_then_errors(tmp_path):
+    import asyncio, httpx, pytest
+    from app import media
+    og = '<meta property="og:image" content="https://cdn.example/a.jpg"><meta property="og:description" content="hi &amp; bye">'
+    def handler(req):
+        if "/embed/" in req.url.path:
+            return httpx.Response(200, text="<html>login</html>")
+        if req.url.host == "cdn.example":
+            return httpx.Response(200, content=b"\xff\xd8" + b"1" * 100, headers={"content-type": "image/jpeg"})
+        return httpx.Response(200, text=og)
+    res = asyncio.run(media.instagram_photos("https://instagram.com/p/XYZ/", tmp_path,
+                                             client=httpx.AsyncClient(transport=httpx.MockTransport(handler))))
+    assert len(res["paths"]) == 1 and res["caption"] == "hi & bye" and res["source"].startswith("preview")
+    blocked = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+    with pytest.raises(media.MediaError):
+        asyncio.run(media.instagram_photos("https://instagram.com/p/XYZ/", tmp_path, client=blocked))
+
+
+def test_instagram_photo_post_pipeline(monkeypatch):
+    import subprocess
+    async def novideo(url, work):
+        raise media.MediaError("ERROR: [Instagram] DfHzIYFy-WC: There is no video in this post")
+    monkeypatch.setattr(media, "download_url", novideo)
+
+    async def photos(url, work, client=None):
+        paths = []
+        for i in range(3):
+            p = work / f"slide_{i:02d}.img"
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=white:s=320x320",
+                            "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", str(p)], check=True)
+            paths.append(p)
+        return {"paths": paths, "caption": "Learn Brugada #ekg", "author": "dev_tips", "total_slides": 3,
+                "video_slides": 0, "source": "embed", "webpage_url": url}
+    monkeypatch.setattr(media, "instagram_photos", photos)
+
+    async def go():
+        await hub.handle_update(upd("https://www.instagram.com/p/DfHzIYFy-WC/ slides"))
+        await drain()
+    asyncio.run(go())
+    it = db.recent(1)[0]
+    assert it["kind"] == "image" and it["status"] == "done" and not it.get("error"), it
+    assert it["meta"]["slides"] == 3 and it["meta"]["frames"] == 3
+    assert len(list(Path(it["media_dir"]).glob("frame_*.jpg"))) == 3
