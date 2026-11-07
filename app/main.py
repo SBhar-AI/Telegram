@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from . import mcp_server
+from . import costs, mcp_server
 from .bot import Hub
 from .config import settings
 from .db import DB
@@ -23,6 +23,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 db = DB(settings.db_path)
+costs.bind(db)  # usage log, spend cap and security-screen cache live in the same SQLite file
 tg = Telegram(settings.telegram_token)
 hub = Hub(db, tg)
 mcp_server.bind(hub)

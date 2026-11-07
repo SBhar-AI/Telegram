@@ -69,8 +69,34 @@ class Settings:
     # Resource discovery
     github_token: str = field(default_factory=lambda: _secret("GITHUB_TOKEN"))  # optional; raises rate limits
     find_resources: bool = field(default_factory=lambda: _env("FIND_RESOURCES", "1") != "0")
-    max_searches: int = field(default_factory=lambda: int(_env("MAX_SEARCHES", "6")))
-    max_repo_screens: int = field(default_factory=lambda: int(_env("MAX_REPO_SCREENS", "8")))
+    max_searches: int = field(default_factory=lambda: int(_env("MAX_SEARCHES", "3")))
+    max_repo_screens: int = field(default_factory=lambda: int(_env("MAX_REPO_SCREENS", "3")))
+    # GitHub reports repo size (KB, whole git history). Above this we skip the download: the snapshot would almost
+    # certainly exceed the 40 MB screening limit anyway.
+    max_repo_size_mb: int = field(default_factory=lambda: int(_env("MAX_REPO_SIZE_MB", "80")))
+
+    # Cost controls. Each stage can use its own model and effort ("" = the model's default effort).
+    # Cheap stages (reading the post, tagging, writing the final message) default to Haiku; judgment stages
+    # (security verdicts, skill drafts) stay on CLAUDE_MODEL (Sonnet).
+    model_analyze: str = field(default_factory=lambda: _env("CLAUDE_MODEL_ANALYZE", "claude-haiku-5-5"))
+    model_breakdown: str = field(default_factory=lambda: _env("CLAUDE_MODEL_BREAKDOWN", "claude-haiku-5-5"))
+    model_resolve: str = field(default_factory=lambda: _env("CLAUDE_MODEL_RESOLVE", ""))  # "" = CLAUDE_MODEL
+    model_security: str = field(default_factory=lambda: _env("CLAUDE_MODEL_SECURITY", ""))
+    model_skill: str = field(default_factory=lambda: _env("CLAUDE_MODEL_SKILL", ""))
+    model_ask: str = field(default_factory=lambda: _env("CLAUDE_MODEL_ASK", ""))
+    effort_analyze: str = field(default_factory=lambda: _env("EFFORT_ANALYZE", "low").lower())
+    effort_breakdown: str = field(default_factory=lambda: _env("EFFORT_BREAKDOWN", "low").lower())
+    effort_resolve: str = field(default_factory=lambda: _env("EFFORT_RESOLVE", "low").lower())
+    effort_security: str = field(default_factory=lambda: _env("EFFORT_SECURITY", "medium").lower())
+    effort_skill: str = field(default_factory=lambda: _env("EFFORT_SKILL", "medium").lower())
+    effort_ask: str = field(default_factory=lambda: _env("EFFORT_ASK", "low").lower())
+    # Estimated-spend ceiling per UTC day. When reached, only cheap steps run (no web search, no AI security
+    # review — the static scanner still runs — no automatic skill drafts) and Sahil is told once. 0 = no cap.
+    daily_spend_cap_usd: float = field(default_factory=lambda: float(_env("DAILY_SPEND_CAP_USD", "1.0") or 0))
+    # Skill drafts are the priciest step and only sometimes wanted: off = on demand with /skill 12.
+    auto_skill_draft: bool = field(default_factory=lambda: _env("AUTO_SKILL_DRAFT", "0") == "1")
+    # After a credit/billing or API-key error, tell Sahil at most once per this many hours.
+    billing_alert_hours: float = field(default_factory=lambda: float(_env("BILLING_ALERT_HOURS", "6")))
 
     # Automatic retries
     max_attempts: int = field(default_factory=lambda: int(_env("MAX_ATTEMPTS", "3")))
@@ -91,6 +117,19 @@ class Settings:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "media").mkdir(exist_ok=True)
         (self.data_dir / "tmp").mkdir(exist_ok=True)
+
+    STAGES = ("analyze", "breakdown", "resolve", "security", "skill", "ask")
+
+    def model_for(self, stage: str) -> str:
+        if stage == "tag":
+            stage = "analyze"
+        return (getattr(self, f"model_{stage}", "") or self.claude_model) if stage in self.STAGES else self.claude_model
+
+    def effort_for(self, stage: str) -> str:
+        if stage == "tag":
+            stage = "analyze"
+        e = getattr(self, f"effort_{stage}", "") if stage in self.STAGES else ""
+        return e if e in {"low", "medium", "high", "xhigh", "max"} else ""
 
     @property
     def db_path(self) -> Path:

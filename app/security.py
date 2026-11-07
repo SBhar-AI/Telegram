@@ -19,13 +19,20 @@ from typing import Any
 
 import httpx
 
-from . import ai, scanner
+from . import ai, costs, scanner
 from .config import settings
 from .resources import _gh_headers, parse_github
 
 log = logging.getLogger("hub.security")
 
 MAX_TARBALL = 40 * 1024 * 1024
+REVIEW_CHAR_BUDGET = 40_000   # was ~90k chars per repo; scanner findings + skill/README text, trimmed to fit
+NOSHA_TTL_DAYS = 7            # cache life when GitHub didn't tell us the commit (rate-limited)
+CACHEABLE = {"claude+scanner", "size-limit"}  # never cache errors or scanner-only (cap) results
+
+
+class TooLarge(RuntimeError):
+    pass
 MAX_FILES = 4000
 MAX_EXTRACTED = 80 * 1024 * 1024
 ORDER = {"green": 0, "yellow": 1, "red": 2}
@@ -108,14 +115,14 @@ def _safe_extract(tf: tarfile.TarFile, dest: Path) -> list[str]:
     return notes
 
 
-async def fetch_repo(url: str, dest: Path) -> dict[str, Any]:
-    """Download a GitHub repo snapshot (pinned to a commit) into dest. Returns provenance info."""
+async def repo_head(url: str) -> dict[str, Any]:
+    """Repo metadata + current commit SHA (two small API calls, no download). Raises on a missing repo."""
     parsed = parse_github(url)
     if not parsed:
         raise ValueError("not a GitHub repo URL")
     owner, repo = parsed
     api = f"https://api.github.com/repos/{owner}/{repo}"
-    async with httpx.AsyncClient(timeout=60, headers=_gh_headers(), follow_redirects=True) as c:
+    async with httpx.AsyncClient(timeout=30, headers=_gh_headers(), follow_redirects=True) as c:
         meta_r = await c.get(api)
         if meta_r.status_code in (403, 429):  # rate-limited: snapshot the default branch via github.com instead
             log.warning("GitHub API rate-limited for %s/%s; using archive download", owner, repo)
@@ -126,9 +133,24 @@ async def fetch_repo(url: str, dest: Path) -> dict[str, Any]:
             meta = meta_r.json()
         branch = meta.get("default_branch") or "main"
         sha = ""
-        br = await c.get(f"{api}/commits/{branch}")
-        if br.status_code == 200:
-            sha = br.json().get("sha", "")
+        if branch != "HEAD":
+            br = await c.get(f"{api}/commits/{branch}")
+            if br.status_code == 200:
+                sha = br.json().get("sha", "")
+    return {"meta": meta, "branch": branch, "sha": sha, "full_name": meta.get("full_name") or f"{owner}/{repo}",
+            "size_kb": meta.get("size")}
+
+
+async def fetch_repo(url: str, dest: Path, head: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Download a GitHub repo snapshot (pinned to a commit) into dest. Returns provenance info."""
+    parsed = parse_github(url)
+    if not parsed:
+        raise ValueError("not a GitHub repo URL")
+    owner, repo = parsed
+    api = f"https://api.github.com/repos/{owner}/{repo}"
+    head = head or await repo_head(url)
+    meta, branch, sha = head["meta"], head["branch"], head["sha"]
+    async with httpx.AsyncClient(timeout=60, headers=_gh_headers(), follow_redirects=True) as c:
         buf = io.BytesIO()
         tar_url = f"{api}/tarball/{sha or branch}" if branch != "HEAD" else f"https://github.com/{owner}/{repo}/archive/HEAD.tar.gz"
         async with c.stream("GET", tar_url) as r:
@@ -137,7 +159,7 @@ async def fetch_repo(url: str, dest: Path) -> dict[str, Any]:
             async for chunk in r.aiter_bytes():
                 buf.write(chunk)
                 if buf.tell() > MAX_TARBALL:
-                    raise RuntimeError("repository too large to screen automatically (>40 MB)")
+                    raise TooLarge("repository too large to screen automatically (>40 MB)")
     buf.seek(0)
     with tarfile.open(fileobj=buf, mode="r:gz") as tf:
         notes = _safe_extract(tf, dest)
@@ -173,22 +195,25 @@ def provenance_flags(p: dict[str, Any]) -> list[str]:
 
 
 # ------------------------------------------------------------------ review
-def _compact_scan(res: dict[str, Any], limit: int = 70) -> dict[str, Any]:
+def _compact_scan(res: dict[str, Any], limit: int = 40) -> dict[str, Any]:
+    """Scanner output for the reviewer. HIGH findings sort first, so trimming drops MEDIUM/low-value rows first."""
     seen, rows = set(), []
     for cat, lvl, rel, ln, desc, snip in sorted(res["findings"], key=lambda f: (f[1] != "HIGH", f[0], f[2], f[3])):
         key = (cat, rel, ln, desc)
         if key in seen:
             continue
         seen.add(key)
-        rows.append({"level": lvl, "category": cat, "where": f"{rel}:{ln}" if ln else rel, "what": desc, "snippet": snip})
+        rows.append({"level": lvl, "category": cat, "where": f"{rel}:{ln}" if ln else rel, "what": desc,
+                     "snippet": str(snip)[:200]})
     counts = {"HIGH": sum(1 for r in rows if r["level"] == "HIGH"), "MEDIUM": sum(1 for r in rows if r["level"] == "MEDIUM")}
-    return {"auto_tier": res["auto_tier"], "counts": counts, "inventory": {k: v[:40] for k, v in res["inventory"].items()},
-            "domains": res["domains"][:40], "combined_risks": res["combined_risks"],
+    inv = {k: (v if len(v) <= 12 else v[:12] + [f"... and {len(v) - 12} more"]) for k, v in res["inventory"].items()}
+    return {"auto_tier": res["auto_tier"], "counts": counts, "inventory": inv,
+            "domains": res["domains"][:25], "combined_risks": res["combined_risks"],
             "review_combos": res.get("review_combos", []), "findings": rows[:limit],
             "truncated": len(rows) > limit}
 
 
-def _skill_texts(root: Path, max_files: int = 6, max_chars: int = 7000) -> list[dict[str, str]]:
+def _skill_texts(root: Path, max_files: int = 6, max_chars: int = 6000) -> list[dict[str, str]]:
     out = []
     for p in sorted(root.rglob("*")):
         if p.is_file() and p.name.lower() == "skill.md":
@@ -207,24 +232,48 @@ def floor_from_scan(auto_tier: str) -> str:
     return {"BLOCK-candidate": "yellow", "HIGH-review": "yellow"}.get(auto_tier, "green")
 
 
+def scanner_only(scan_compact: dict) -> dict[str, Any]:
+    v = {"BLOCK-candidate": "red", "HIGH-review": "yellow"}.get(scan_compact["auto_tier"], "yellow")
+    return {"verdict": v, "summary": "Automated scan only (no AI review available).",
+            "why": [{"reason": f["what"], "evidence": f["where"], "severity": f["level"].lower()}
+                    for f in scan_compact["findings"][:8]],
+            "make_safer": ["Have Claude review it with the skill-security-screen skill before using it."],
+            "reviewer": "scanner-only"}
+
+
+def review_material(subject: str, scan_compact: dict, provenance: dict | None, texts: list[dict],
+                    budget: int = REVIEW_CHAR_BUDGET) -> str:
+    """JSON for the reviewer, kept under `budget` characters by trimming the long file texts first (the scanner
+    has already read every file in full and its findings are always included)."""
+    prov = {k: v for k, v in (provenance or {}).items() if k != "extract_notes"} or "n/a (not a repository)"
+    files = [dict(t) for t in texts]
+
+    def dump() -> str:
+        return json.dumps({"subject": subject, "provenance": prov,
+                           "provenance_flags": provenance_flags(provenance) if provenance else [],
+                           "static_scan": scan_compact, "files_UNTRUSTED": files}, ensure_ascii=False)
+    out = dump()
+    while len(out) > budget and any(len(f["content"]) > 800 for f in files):
+        for f in files:
+            if len(f["content"]) > 800:
+                f["content"] = f["content"][: int(len(f["content"]) * 0.7)] + "\n[... trimmed for length ...]"
+        out = dump()
+    return out[:budget]
+
+
 async def review(subject: str, scan_compact: dict, provenance: dict | None, texts: list[dict]) -> dict[str, Any]:
-    """Independent Claude review → verdict + why + make_safer. Falls back to scanner-only if no API key."""
+    """Independent Claude review → verdict + why + make_safer. Falls back to scanner-only if no API key
+    or today's spending cap is reached."""
     floor = floor_from_scan(scan_compact["auto_tier"])
     if not settings.anthropic_key:
-        v = {"BLOCK-candidate": "red", "HIGH-review": "yellow"}.get(scan_compact["auto_tier"], "yellow")
-        return {"verdict": v, "summary": "Automated scan only (no AI review available).",
-                "why": [{"reason": f["what"], "evidence": f["where"], "severity": f["level"].lower()}
-                        for f in scan_compact["findings"][:8]],
-                "make_safer": ["Have Claude review it with the skill-security-screen skill before using it."],
-                "reviewer": "scanner-only"}
-    material = {
-        "subject": subject,
-        "provenance": provenance or "n/a (not a repository)",
-        "provenance_flags": provenance_flags(provenance) if provenance else [],
-        "static_scan": scan_compact,
-        "files_UNTRUSTED": texts,
-    }
-    raw = await ai.claude(REVIEW_SYSTEM, json.dumps(material, ensure_ascii=False)[:90000], max_tokens=3000, tool=VERDICT_TOOL)
+        return scanner_only(scan_compact)
+    if costs.over_cap():
+        v = scanner_only(scan_compact)
+        v["summary"] = "Automated scan only: today's AI spending limit was reached. " + v["summary"].split(": ", 1)[-1]
+        v["reviewer"] = "scanner-only (daily cap)"
+        return v
+    raw = await ai.claude(REVIEW_SYSTEM, review_material(subject, scan_compact, provenance, texts),
+                          max_tokens=4000, tool=VERDICT_TOOL, stage="security")
     v = ai.parse_json(raw)
     verdict = v.get("verdict") if v.get("verdict") in ORDER else "yellow"
     if ORDER[verdict] < ORDER[floor]:
@@ -249,10 +298,73 @@ def _package(v: dict, scan_compact: dict, provenance: dict | None, kind: str) ->
     }
 
 
+def _cache_key(full_name: str, sha: str) -> str:
+    return f"repo:{full_name}@{sha or 'nosha'}".lower()
+
+
+def _cache_get(key: str) -> dict[str, Any] | None:
+    store = costs.db()
+    if store is None:
+        return None
+    hit = store.screen_get(key)
+    if not hit:
+        return None
+    if key.endswith("@nosha"):
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(hit["_cached_at"])
+            if age.days >= NOSHA_TTL_DAYS:
+                return None
+        except (KeyError, ValueError):
+            return None
+    hit["cached_at"] = hit.pop("_cached_at", "")
+    hit["cached"] = True
+    return hit
+
+
+def _cache_put(key: str, result: dict[str, Any]) -> None:
+    store = costs.db()
+    if store is not None and result.get("reviewer") in CACHEABLE:
+        store.screen_put(key, {k: v for k, v in result.items() if k not in ("cached", "cached_at")})
+
+
+def _too_large(name: str, detail: str, prov: dict | None = None) -> dict[str, Any]:
+    return {"verdict": "yellow", "summary": f"Too big to screen automatically ({detail}).", "kind": "github",
+            "why": [{"reason": "The repository is too large for the automatic download-and-scan, so its safety is unknown.",
+                     "evidence": detail, "severity": "medium"}],
+            "make_safer": ["Only use the specific skill folder you need, and screen it in Claude with the "
+                           "skill-security-screen skill first."],
+            "reviewer": "size-limit", "auto_tier": "unknown", "counts": {}, "provenance": prov or {"repo": name},
+            "screened_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()}
+
+
 async def screen_repo(url: str) -> dict[str, Any]:
+    """Screen a repo once per commit: cached by repo + SHA; too-big repos are rejected before downloading."""
+    parsed = parse_github(url)
+    name = "/".join(parsed) if parsed else url
     tmp = Path(tempfile.mkdtemp(prefix="screen-", dir=str(settings.data_dir / "tmp")))
+    key = ""
     try:
-        prov = await fetch_repo(url, tmp)
+        head = await repo_head(url)
+        name = head["full_name"]
+        key = _cache_key(name, head["sha"])
+        hit = _cache_get(key)
+        if hit:
+            log.info("screen cache hit %s", key)
+            return hit
+        size_kb = head.get("size_kb")
+        if isinstance(size_kb, (int, float)) and size_kb > settings.max_repo_size_mb * 1024:
+            out = _too_large(name, f"GitHub reports {size_kb / 1024:.0f} MB; limit {settings.max_repo_size_mb} MB",
+                             {"repo": name, "sha": head["sha"]})
+            _cache_put(key, out)
+            return out
+        try:
+            prov = await fetch_repo(url, tmp, head=head)
+        except TooLarge as e:
+            out = _too_large(name, str(e), {"repo": name, "sha": head["sha"]})
+            _cache_put(key, out)
+            return out
+        if prov.get("sha") and not head["sha"]:
+            key = _cache_key(name, prov["sha"])
         res = scanner.scan(str(tmp))
         res["auto_tier"] = scanner.auto_tier(res)
         for n in prov.get("extract_notes", []):
@@ -263,7 +375,10 @@ async def screen_repo(url: str) -> dict[str, Any]:
         v = await review(f"GitHub repo {prov.get('repo')} @ {prov.get('sha', '')[:12]}", comp, prov, _skill_texts(tmp))
         out = _package(v, comp, prov, "github")
         out["sha256"] = dict(list(res["sha256"].items())[:200])
+        _cache_put(key, out)
         return out
+    except ai.AccountError:
+        raise  # out of credit / bad key: let the job park instead of recording a fake verdict
     except Exception as e:
         log.warning("screen_repo failed for %s: %s", url, e)
         return {"verdict": "yellow", "summary": f"Couldn't screen automatically: {e}", "kind": "github",

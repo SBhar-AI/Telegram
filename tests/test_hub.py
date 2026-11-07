@@ -13,6 +13,8 @@ os.environ.update({
     "DATA_DIR": TMP, "TELEGRAM_BOT_TOKEN": "", "CLAIM_CODE": "abc123", "ANTHROPIC_API_KEY": "test",
     "TODOIST_API_TOKEN": "test", "MCP_SECRET": "s3cret", "TRANSCRIBE_BACKEND": "openai", "OPENAI_API_KEY": "x",
     "PUBLIC_URL": "https://example.test", "RETRY_DELAYS": "0,0",
+    "AUTO_SKILL_DRAFT": "1",  # most tests cover the full pipeline; the on-demand default is tested separately
+    "DAILY_SPEND_CAP_USD": "0",
 })
 
 from app import ai, bot, media, resources, security, todoist
@@ -35,7 +37,7 @@ def mocks(monkeypatch):
     async def noop(*a, **k):
         return None
 
-    async def fake_claude(system, content, max_tokens=2000, tool=None):
+    async def fake_claude(system, content, max_tokens=2000, tool=None, stage=None):
         if tool and tool["name"] == "content_breakdown":
             text = content if isinstance(content, str) else json.dumps(content)
             names = [l[2:] for l in text.split("# Resources found (use these exact names)")[-1].splitlines() if l.startswith("- ")]
@@ -101,7 +103,13 @@ def mocks(monkeypatch):
     monkeypatch.setattr(resources, "github_info", fake_gh)
     monkeypatch.setattr(resources, "fetch_page", fake_page)
 
-    async def fake_fetch_repo(url, dest):
+    async def fake_head(url):
+        name = url.split("github.com/")[-1]
+        return {"meta": {}, "branch": "main", "sha": "abc123def456" + name.replace("/", ""), "full_name": name,
+                "size_kb": 900}
+    monkeypatch.setattr(security, "repo_head", fake_head)
+
+    async def fake_fetch_repo(url, dest, head=None):
         src = FIX / ("evil" if "evil" in url else "benign")
         shutil.copytree(src, dest, dirs_exist_ok=True)
         return {"repo": url.split("github.com/")[-1], "url": url, "sha": "abc123def456", "stars": 42, "license": "MIT",
@@ -374,7 +382,7 @@ def test_claude_tool_nudge(monkeypatch):
     from app import ai as ai_mod
     calls = []
 
-    async def fake_post(body):
+    async def fake_post(body, *a, **k):
         calls.append(body)
         assert body["tool_choice"] == {"type": "auto"}
         if len(calls) == 1:
