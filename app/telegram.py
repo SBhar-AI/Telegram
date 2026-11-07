@@ -168,5 +168,6 @@ class Telegram:
             ("get", "Show one item in full: /get 12"),
             ("delete", "Delete an item: /delete 12"),
             ("status", "Service health and config"),
+            ("cost", "Estimated AI spend today / this week"),
         ]
         await self.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in cmds])

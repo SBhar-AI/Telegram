@@ -35,6 +35,7 @@ Browser ──▶ /view/<MCP_SECRET>/item/<id>       (private read-only item pag
 | `/failed`, `/retry N`, `/retry failed` | Failed jobs retry automatically: 3 attempts, 30 s and then 2 min apart. Only after the 3rd failure do you get one message listing all 3 errors, and the item appears in `/failed` for you to review. Jobs that a restart interrupted resume on their own. |
 | `/resources`, `/skills`, `/find N`, `/skill N` | Browse found resources, see the skill inbox, re-run resource search, or force a skill draft |
 | `/retry photos` | Re-read Instagram photo/carousel posts saved before photo support (slides are now read as images) |
+| `/cost` | Estimated AI spend today / 7 days / 30 days, per step, from the token counts the API reports |
 | `/todo`, `/queue`, `/ask`, `/recent`, `/get N`, `/delete N`, `/status` | See `/help` in the bot |
 
 No patient information should go through this bot. The analyser flags anything that looks like PHI.
@@ -58,7 +59,14 @@ No patient information should go through this bot. The analyser flags anything t
 | `FIND_RESOURCES` | no | `1` (default) looks up resources automatically. `0` makes it on-demand only (`/find N`) |
 | `MAX_ATTEMPTS` / `RETRY_DELAYS` | no | Automatic retries (default 3 attempts; delays `30,120` seconds) |
 | `MAX_REPO_SCREENS` | no | Maximum repos screened automatically per item (default 3) |
-| `MAX_SEARCHES` | no | Maximum web searches per item (default 6, at about $0.01 per search) |
+| `MAX_SEARCHES` | no | Maximum web searches per item (default 3, at $0.01 per search) |
+| `MAX_REPO_SIZE_MB` | no | Repos GitHub reports as bigger than this (default 80) are not downloaded for screening |
+| `DAILY_SPEND_CAP_USD` | no | Estimated AI spend per UTC day (default `1.0`; `0` = no cap). When reached: no web search, no AI security review (the static scan still runs), no automatic skill drafts; you're told once. See `/cost` |
+| `AUTO_SKILL_DRAFT` | no | `0` (default): skill drafts only when you send `/skill N`. `1`: draft automatically, as before |
+| `CLAUDE_MODEL_ANALYZE`, `_BREAKDOWN` | no | Default `claude-haiku-5-5` (reading the post, tagging, the final message) |
+| `CLAUDE_MODEL_RESOLVE`, `_SECURITY`, `_SKILL`, `_ASK` | no | Default empty = `CLAUDE_MODEL` (Sonnet) |
+| `EFFORT_ANALYZE`, `_BREAKDOWN`, `_RESOLVE`, `_ASK` / `EFFORT_SECURITY`, `_SKILL` | no | Thinking effort per step: default `low` / `medium`. Empty = the model's own default |
+| `BILLING_ALERT_HOURS` | no | After an out-of-credit or bad-key error, items are parked (not retried) and you're told at most once per this many hours (default 6) |
 | `DEFAULT_TEXT_ACTION` | no | `note` (default) or `todo` |
 | `KEEP_VIDEO` | no | `1` keeps the original video files. By default only the frames are kept, to save space |
 

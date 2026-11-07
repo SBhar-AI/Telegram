@@ -13,6 +13,8 @@ os.environ.update({
     "DATA_DIR": TMP, "TELEGRAM_BOT_TOKEN": "", "CLAIM_CODE": "abc123", "ANTHROPIC_API_KEY": "test",
     "TODOIST_API_TOKEN": "test", "MCP_SECRET": "s3cret", "TRANSCRIBE_BACKEND": "openai", "OPENAI_API_KEY": "x",
     "PUBLIC_URL": "https://example.test", "RETRY_DELAYS": "0,0",
+    "AUTO_SKILL_DRAFT": "1",  # most tests cover the full pipeline; the on-demand default is tested separately
+    "DAILY_SPEND_CAP_USD": "0",
 })
 
 from app import ai, bot, media, resources, security, todoist
@@ -35,7 +37,7 @@ def mocks(monkeypatch):
     async def noop(*a, **k):
         return None
 
-    async def fake_claude(system, content, max_tokens=2000, tool=None):
+    async def fake_claude(system, content, max_tokens=2000, tool=None, stage=None):
         if tool and tool["name"] == "content_breakdown":
             text = content if isinstance(content, str) else json.dumps(content)
             names = [l[2:] for l in text.split("# Resources found (use these exact names)")[-1].splitlines() if l.startswith("- ")]
@@ -101,7 +103,13 @@ def mocks(monkeypatch):
     monkeypatch.setattr(resources, "github_info", fake_gh)
     monkeypatch.setattr(resources, "fetch_page", fake_page)
 
-    async def fake_fetch_repo(url, dest):
+    async def fake_head(url):
+        name = url.split("github.com/")[-1]
+        return {"meta": {}, "branch": "main", "sha": "abc123def456" + name.replace("/", ""), "full_name": name,
+                "size_kb": 900}
+    monkeypatch.setattr(security, "repo_head", fake_head)
+
+    async def fake_fetch_repo(url, dest, head=None):
         src = FIX / ("evil" if "evil" in url else "benign")
         shutil.copytree(src, dest, dirs_exist_ok=True)
         return {"repo": url.split("github.com/")[-1], "url": url, "sha": "abc123def456", "stars": 42, "license": "MIT",
@@ -374,7 +382,7 @@ def test_claude_tool_nudge(monkeypatch):
     from app import ai as ai_mod
     calls = []
 
-    async def fake_post(body):
+    async def fake_post(body, *a, **k):
         calls.append(body)
         assert body["tool_choice"] == {"type": "auto"}
         if len(calls) == 1:
@@ -618,3 +626,292 @@ def test_instagram_photo_post_pipeline(monkeypatch):
     assert it["kind"] == "image" and it["status"] == "done" and not it.get("error"), it
     assert it["meta"]["slides"] == 3 and it["meta"]["frames"] == 3
     assert len(list(Path(it["media_dir"]).glob("frame_*.jpg"))) == 3
+
+
+# ====================================================================== cost-optimization tests
+from app import costs  # noqa: E402
+from app.config import settings as SETTINGS  # noqa: E402
+
+
+class FakeResp:
+    def __init__(self, status, payload=None, text=""):
+        self.status_code, self._p, self.text = status, payload or {}, text or json.dumps(payload or {})
+
+    def json(self):
+        return self._p
+
+
+def _fake_client(monkeypatch, responses):
+    calls = []
+
+    async def post(url, headers=None, json=None, **k):
+        calls.append(json)
+        return responses.pop(0)
+    monkeypatch.setattr(ai._client, "post", post)
+    monkeypatch.setattr(ai.settings, "anthropic_key", "k")
+    return calls
+
+
+def test_account_error_classification():
+    assert ai.is_account_error(400, '{"error":{"message":"Your credit balance is too low to access the Anthropic API."}}')
+    assert ai.is_account_error(401, "invalid x-api-key") and ai.is_account_error(403, "permission")
+    assert not ai.is_account_error(400, "messages: field required")
+    assert not ai.is_account_error(529, "overloaded")
+
+
+def test_credit_error_not_retried_and_usage_logged(monkeypatch):
+    credit = FakeResp(400, text='{"error":{"type":"invalid_request_error","message":"Your credit balance is too low"}}')
+    calls = _fake_client(monkeypatch, [credit])
+    with pytest.raises(ai.AccountError):
+        asyncio.run(ai._post({"model": "claude-sonnet-5-5"}, "analyze"))
+    assert len(calls) == 1  # no pointless retries
+
+    ok = FakeResp(200, {"content": [{"type": "text", "text": "hi"}], "usage": {
+        "input_tokens": 1000, "output_tokens": 500, "server_tool_use": {"web_search_requests": 2}}})
+    _fake_client(monkeypatch, [ok])
+    before = db.spend_since("2000-01-01")["cost"]
+    asyncio.run(ai._post({"model": "claude-sonnet-5-5"}, "resolve"))
+    after = db.spend_since("2000-01-01")
+    assert abs((after["cost"] - before) - (0.002 + 0.005 + 0.02)) < 1e-9  # $2/M in, $10/M out, $10/1k searches
+    assert "resolve" in after["by_stage"]
+
+
+def test_cost_of_haiku_and_cache():
+    usd, c = costs.cost_of("claude-haiku-5-5", {"input_tokens": 20000, "output_tokens": 1000})
+    assert abs(usd - (0.002 + 0.0005)) < 1e-12
+    usd, _ = costs.cost_of("claude-sonnet-5-5", {"input_tokens": 0, "output_tokens": 0,
+                                                 "cache_creation_input_tokens": 1_000_000, "cache_read_input_tokens": 1_000_000})
+    assert abs(usd - 2.60) < 1e-9
+    usd, _ = costs.cost_of("claude-haiku-5-5", {"input_tokens": 200_000, "output_tokens": 0})
+    assert abs(usd - 0.10) < 1e-9  # long-prompt Haiku tier ($0.50/M)
+
+
+def test_stage_models_effort_and_safe_fallback(monkeypatch):
+    assert SETTINGS.model_for("analyze") == "claude-haiku-5-5" and SETTINGS.model_for("tag") == "claude-haiku-5-5"
+    assert SETTINGS.model_for("breakdown") == "claude-haiku-5-5"
+    assert SETTINGS.model_for("security") == SETTINGS.claude_model == SETTINGS.model_for("skill")
+    b = ai.stage_body("analyze", {"model": "x", "max_tokens": 10})
+    assert b["model"] == "claude-haiku-5-5" and b["output_config"] == {"effort": "low"}
+    assert ai.stage_body("security", {})["output_config"] == {"effort": "medium"}
+
+    rejected = FakeResp(400, text='{"error":{"message":"model claude-haiku-5-5 does not support web_search"}}')
+    ok = FakeResp(200, {"content": [], "usage": {"input_tokens": 1, "output_tokens": 1}})
+    calls = _fake_client(monkeypatch, [rejected, ok])
+    try:
+        asyncio.run(ai._post(ai.stage_body("analyze", {"max_tokens": 5}), "analyze"))
+        assert calls[0]["model"] == "claude-haiku-5-5"
+        assert calls[1]["model"] == SETTINGS.claude_model and "output_config" not in calls[1]
+        assert ai.stage_body("analyze", {})["model"] == SETTINGS.claude_model  # sticky for this run
+    finally:
+        ai._degraded.clear()
+
+    plain_400 = FakeResp(400, text='{"error":{"message":"messages: field required"}}')
+    calls = _fake_client(monkeypatch, [plain_400])
+    with pytest.raises(ai.AIError):
+        asyncio.run(ai._post(ai.stage_body("analyze", {}), "analyze"))
+    assert len(calls) == 1 and not ai._degraded
+
+
+def test_credit_out_parks_items_and_alerts_once(monkeypatch):
+    async def no_credit(url, work):
+        raise ai.AccountError('Claude API 400: {"error":{"message":"Your credit balance is too low"}}')
+    monkeypatch.setattr(media, "download_url", no_credit)
+    db.kv_set("account_alert_at", "2000-01-01T00:00:00+00:00")
+
+    async def go():
+        await hub.handle_update(upd("https://www.instagram.com/reel/NOCREDIT1/"))
+        a = db.recent(1)[0]["id"]
+        await run_worker_until(lambda: (db.get(a)["meta"] or {}).get("parked"))
+        await hub.handle_update(upd("https://www.instagram.com/reel/NOCREDIT2/"))
+        b = db.recent(1)[0]["id"]
+        await run_worker_until(lambda: (db.get(b)["meta"] or {}).get("parked"))
+        return a, b
+    a, b = asyncio.run(go())
+    for iid in (a, b):
+        it = db.get(iid)
+        assert it["status"] == "error" and it["meta"]["needs_attention"] and it["meta"]["parked"]["reason"] == "account"
+        assert len(it["meta"]["errors"]) == 1 and "url" not in (it["meta"].get("pending_jobs") or {})
+    alerts = [m for m in SENT if "credits are out" in m]
+    assert len(alerts) == 1 and "/retry failed" in alerts[0]
+    assert not any("failed 3 times" in m for m in SENT)
+
+    async def go2():
+        await hub.handle_update(upd("/retry failed"))
+    asyncio.run(go2())
+    assert "url" in (db.get(a)["meta"].get("pending_jobs") or {}) and not db.get(a)["meta"].get("needs_attention")
+    while not hub.queue.empty():
+        hub.queue.get_nowait(); hub.queue.task_done()
+
+
+def test_security_screen_cached_by_commit(monkeypatch):
+    fetched = []
+    orig = security.fetch_repo
+
+    async def counting(url, dest, head=None):
+        fetched.append(url)
+        return await orig(url, dest, head)
+    monkeypatch.setattr(security, "fetch_repo", counting)
+    url = "https://github.com/cache/test-repo"
+    a = asyncio.run(security.screen_repo(url))
+    b = asyncio.run(security.screen_repo(url))
+    assert len(fetched) == 1 and not a.get("cached") and b.get("cached") and b["verdict"] == a["verdict"]
+
+    async def new_commit(u):
+        return {"meta": {}, "branch": "main", "sha": "fffffff", "full_name": "cache/test-repo", "size_kb": 10}
+    monkeypatch.setattr(security, "repo_head", new_commit)
+    asyncio.run(security.screen_repo(url))
+    assert len(fetched) == 2  # new commit -> screened again
+
+
+def test_large_repo_skipped_without_download(monkeypatch):
+    fetched = []
+
+    async def never(url, dest, head=None):
+        fetched.append(url)
+        raise AssertionError("should not download")
+    monkeypatch.setattr(security, "fetch_repo", never)
+
+    async def huge(u):
+        return {"meta": {}, "branch": "main", "sha": "big1", "full_name": "big/monorepo", "size_kb": 500_000}
+    monkeypatch.setattr(security, "repo_head", huge)
+    out = asyncio.run(security.screen_repo("https://github.com/big/monorepo"))
+    assert not fetched and out["reviewer"] == "size-limit" and out["verdict"] == "yellow" and "Too big" in out["summary"]
+    assert asyncio.run(security.screen_repo("https://github.com/big/monorepo")).get("cached")
+
+
+def test_streamed_too_large_is_cached(monkeypatch):
+    n = []
+
+    async def too_big(url, dest, head=None):
+        n.append(1)
+        raise security.TooLarge("repository too large to screen automatically (>40 MB)")
+    monkeypatch.setattr(security, "fetch_repo", too_big)
+    for _ in range(3):
+        out = asyncio.run(security.screen_repo("https://github.com/vercel-labs/agent-desktop"))
+    assert len(n) == 1 and out["reviewer"] == "size-limit" and out.get("cached")
+
+
+def test_account_error_not_turned_into_fake_verdict(monkeypatch):
+    async def broke(*a, **k):
+        raise ai.AccountError("Claude API 400: credit balance is too low")
+    monkeypatch.setattr(security, "review", broke)
+    with pytest.raises(ai.AccountError):
+        asyncio.run(security.screen_repo("https://github.com/acct/err-repo"))
+    assert db.screen_get("repo:acct/err-repo@abc123def456accterr-repo") is None
+
+
+def test_reviewer_input_is_bounded_and_keeps_findings():
+    comp = {"auto_tier": "HIGH-review", "counts": {"HIGH": 1}, "domains": [], "combined_risks": [], "inventory": {},
+            "findings": [{"level": "HIGH", "category": "network", "where": "s.sh:1", "what": "Network CLI", "snippet": "curl x"}]}
+    texts = [{"path": f"s{i}/SKILL.md", "content": "word " * 3000} for i in range(6)]
+    out = security.review_material("repo x", comp, {"repo": "x", "stars": 3}, texts)
+    assert len(out) <= security.REVIEW_CHAR_BUDGET and "Network CLI" in out and "s5/SKILL.md" in out
+    small = security.review_material("repo y", comp, None, [{"path": "SKILL.md", "content": "short"}])
+    assert '"short"' in small  # small material untouched
+
+
+def test_junk_slugs_filtered():
+    text = ("Titrate O2 at 4 L/min. Works in ChatGPT/Claude and iOS/Android. 5 mg/kg. "
+            "Repo: wheresryan22/anatomy and https://github.com/x/min")
+    assert resources.find_slugs(text) == [("wheresryan22", "anatomy"), ("x", "min")]
+    assert resources.find_slugs("TheAlgorithms/Python") == [("TheAlgorithms", "Python")]
+
+
+def test_well_known_and_generic_resources_skip_web_search(monkeypatch):
+    web_calls = []
+
+    async def resolver(res, context):
+        web_calls.append([r["name"] for r in res])
+        return []
+    monkeypatch.setattr(ai, "resolve_resources", resolver)
+    iid = db.create("video", status="done", title="AI tools reel", meta={"extracted_resources": [
+        {"name": "ChatGPT", "type": "tool", "context": "chat assistant"},
+        {"name": "Skills", "type": "skill"},
+        {"name": "Mystery Prompt Pack", "type": "prompt", "how_to_get": "comment SKILLS"}]})
+    asyncio.run(hub.process_resources(iid, OWNER, None))
+    res = {r["name"]: r for r in db.get(iid)["resources"]}
+    assert web_calls == [["Mystery Prompt Pack"]]
+    assert res["ChatGPT"]["url"] == "https://chatgpt.com" and res["Skills"]["found"] is False
+    while not hub.queue.empty():
+        hub.queue.get_nowait(); hub.queue.task_done()
+
+
+def test_same_repo_listed_once():
+    out = hub._dedupe([{"name": "A", "url": "https://github.com/o/r"}, {"name": "B", "url": "https://github.com/O/r/"},
+                       {"name": "C", "url": ""}, {"name": "D", "url": ""}])
+    assert [r["name"] for r in out] == ["A", "C", "D"] and out[0]["aliases"] == ["B"]
+
+
+def test_daily_cap_cheap_mode(monkeypatch):
+    monkeypatch.setattr(SETTINGS, "daily_spend_cap_usd", 0.01)
+    db.log_usage(item_id=None, stage="analyze", model="claude-sonnet-5-5", input_tokens=1, output_tokens=1,
+                 cache_write_tokens=0, cache_read_tokens=0, web_searches=0, cost_usd=0.05)
+    db.kv_set("cap_alert_day", "2000-01-01")
+    web_calls = []
+
+    async def resolver(res, context):
+        web_calls.append(res)
+        return []
+    monkeypatch.setattr(ai, "resolve_resources", resolver)
+    reviews = []
+    orig_claude = ai.claude
+
+    async def spy(system, content, max_tokens=2000, tool=None, stage=None):
+        if stage == "security":
+            reviews.append(1)
+        return await orig_claude(system, content, max_tokens, tool, stage)
+    monkeypatch.setattr(ai, "claude", spy)
+
+    async def fresh_head(u):  # a commit never screened before, so the cache can't answer
+        return {"meta": {}, "branch": "main", "sha": "capfresh01", "full_name": "someone/ekg-skills", "size_kb": 10}
+    monkeypatch.setattr(security, "repo_head", fresh_head)
+    iid = db.create("video", status="done", title="cap reel", skill_candidate=True,
+                    key_points=["Uses someone/ekg-skills"],
+                    meta={"extracted_resources": [{"name": "Mystery Prompt Pack", "type": "prompt", "how_to_get": "DM"}]})
+
+    async def go():
+        await hub.process_resources(iid, OWNER, None)
+        await asyncio.sleep(0)
+        await drain()
+    asyncio.run(go())
+    it = db.get(iid)
+    res = {r["name"]: r for r in it["resources"]}
+    assert web_calls == [] and "spending cap" in res["Mystery Prompt Pack"]["note"]
+    gh = next(r for r in it["resources"] if "ekg-skills" in (r.get("url") or ""))
+    assert gh["security"]["reviewer"] == "scanner-only (daily cap)" and not gh["security"].get("cached")
+    assert db.screen_get("repo:someone/ekg-skills@capfresh01") is None  # cap-mode verdicts aren't cached
+    assert not reviews and not it.get("skill_draft")  # no AI review, no automatic skill draft
+    assert sum(1 for m in SENT if "daily cap" in m) == 1
+    assert "/cost" in hub.status_text() and "reached" in hub.cost_text()
+
+
+def test_skill_draft_is_on_demand_by_default(monkeypatch):
+    monkeypatch.setattr(SETTINGS, "auto_skill_draft", False)
+
+    async def fake_download(url, work):
+        p = make_video(work / "source.mp4")
+        return {"path": str(p), "title": "IG reel", "caption": "", "author": "t", "duration": 12,
+                "webpage_url": url, "extractor": "Instagram", "upload_date": ""}
+    monkeypatch.setattr(media, "download_url", fake_download)
+    DRAFTS.clear()
+
+    async def go():
+        await hub.handle_update(upd("https://www.instagram.com/reel/ONDEMAND/"))
+        await drain()
+    asyncio.run(go())
+    it = db.recent(1)[0]
+    final = [m for m in SENT if "Brugada vs RBBB + resources" in m]
+    assert len(final) == 1 and f"/skill {it['id']}" in final[0] and not it.get("skill_draft") and not DRAFTS
+
+    async def go2():
+        await hub.handle_update(upd(f"/skill {it['id']}"))
+        await drain()
+    asyncio.run(go2())
+    assert db.get(it["id"])["skill_draft"]["status"] == "pending" and DRAFTS
+
+
+def test_cost_command():
+    async def go():
+        await hub.handle_update(upd("/cost"))
+    asyncio.run(go())
+    assert "Estimated AI spend" in SENT[-1] and "7 days" in SENT[-1]

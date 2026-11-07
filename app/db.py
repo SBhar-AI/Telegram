@@ -37,6 +37,25 @@ CREATE TABLE IF NOT EXISTS items (
 );
 
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+
+-- One row per paid Anthropic API call, with the token counts the API reported and our cost estimate.
+CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    item_id INTEGER,
+    stage TEXT,
+    model TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    web_searches INTEGER DEFAULT 0,
+    cost_usd REAL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS usage_log_ts ON usage_log(ts);
+
+-- Security screens, keyed by repo + commit (a given commit never needs reviewing twice).
+CREATE TABLE IF NOT EXISTS screen_cache (k TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);
 """
 
 FTS_COLS = "title, author, caption, user_note, summary, transcript, key_points, techniques, tags, category, resources"
@@ -203,6 +222,51 @@ class DB:
         with self._lock:
             rows = self._conn.execute("SELECT kind, COUNT(*) c FROM items GROUP BY kind").fetchall()
         return {r["kind"]: r["c"] for r in rows}
+
+    # ---------- usage / spend ----------
+    def log_usage(self, *, item_id: int | None, stage: str, model: str, input_tokens: int, output_tokens: int,
+                  cache_write_tokens: int, cache_read_tokens: int, web_searches: int, cost_usd: float,
+                  ts: str | None = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO usage_log (ts, item_id, stage, model, input_tokens, output_tokens, cache_write_tokens,"
+                " cache_read_tokens, web_searches, cost_usd) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (ts or now_iso(), item_id, stage, model, input_tokens, output_tokens, cache_write_tokens,
+                 cache_read_tokens, web_searches, cost_usd))
+            self._conn.commit()
+
+    def spend_since(self, since_iso: str) -> dict[str, Any]:
+        """Totals since a UTC ISO timestamp: cost, calls, items, searches, and cost per stage."""
+        with self._lock:
+            tot = self._conn.execute(
+                "SELECT COALESCE(SUM(cost_usd),0) c, COUNT(*) n, COUNT(DISTINCT item_id) items,"
+                " COALESCE(SUM(web_searches),0) s FROM usage_log WHERE ts >= ?", (since_iso,)).fetchone()
+            rows = self._conn.execute(
+                "SELECT stage, COALESCE(SUM(cost_usd),0) c, COUNT(*) n FROM usage_log WHERE ts >= ?"
+                " GROUP BY stage ORDER BY c DESC", (since_iso,)).fetchall()
+        return {"cost": float(tot["c"]), "calls": int(tot["n"]), "items": int(tot["items"]),
+                "searches": int(tot["s"]), "by_stage": {r["stage"]: (float(r["c"]), int(r["n"])) for r in rows}}
+
+    # ---------- security screen cache ----------
+    def screen_get(self, k: str) -> dict[str, Any] | None:
+        with self._lock:
+            r = self._conn.execute("SELECT result, created_at FROM screen_cache WHERE k=?", (k.lower(),)).fetchone()
+        if not r:
+            return None
+        try:
+            out = json.loads(r["result"])
+        except ValueError:
+            return None
+        out["_cached_at"] = r["created_at"]
+        return out
+
+    def screen_put(self, k: str, result: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO screen_cache(k, created_at, result) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET"
+                " created_at=excluded.created_at, result=excluded.result",
+                (k.lower(), now_iso(), json.dumps(result, ensure_ascii=False)))
+            self._conn.commit()
 
     # ---------- key/value ----------
     def kv_get(self, k: str) -> str | None:

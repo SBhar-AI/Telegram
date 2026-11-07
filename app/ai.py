@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from . import costs
 from .config import settings
 
 log = logging.getLogger("hub.ai")
@@ -191,24 +192,70 @@ ANALYSIS_TOOL = {
 }
 
 
-async def _post(body: dict) -> dict:
+ACCOUNT_HINTS = ("credit balance", "billing", "purchase credits", "plan and billing")
+# Words in a 400 error that suggest a per-stage override (model / effort) was rejected rather than the request itself.
+OVERRIDE_HINTS = ("model", "effort", "output_config", "not supported", "web_search", "unsupported")
+_degraded: set[str] = set()  # stages whose model/effort override was rejected this run: use plain CLAUDE_MODEL
+
+
+class AccountError(AIError):
+    """Out of credit, or the API key is invalid / not allowed. Retrying cannot help until Sahil fixes the account."""
+
+
+def is_account_error(status: int, text: str) -> bool:
+    low = (text or "").lower()
+    return status in (401, 403) or (status in (400, 402) and any(h in low for h in ACCOUNT_HINTS))
+
+
+def stage_body(stage: str, body: dict) -> dict:
+    """Apply the stage's model and effort (unless an earlier call showed the override is rejected)."""
+    body = dict(body)
+    if stage in _degraded:
+        body["model"] = settings.claude_model
+        body.pop("output_config", None)
+        return body
+    body["model"] = settings.model_for(stage)
+    effort = settings.effort_for(stage)
+    if effort:
+        body["output_config"] = {"effort": effort}
+    return body
+
+
+async def _post(body: dict, stage: str = "other", timeout: float | None = None) -> dict:
     headers = {
         "x-api-key": settings.anthropic_key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    for attempt in range(3):
-        r = await _client.post(ANTHROPIC_URL, headers=headers, json=body)
+    simplified = False
+    attempt = 0
+    while True:
+        kw = {"timeout": timeout} if timeout else {}
+        r = await _client.post(ANTHROPIC_URL, headers=headers, json=body, **kw)
         if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
-            await asyncio.sleep(4 * (attempt + 1))
+            attempt += 1
+            await asyncio.sleep(4 * attempt)
             continue
         if r.status_code >= 400:
+            if is_account_error(r.status_code, r.text):
+                raise AccountError(f"Claude API {r.status_code}: {r.text[:300]}")
+            overridden = body.get("model") != settings.claude_model or "output_config" in body
+            if (r.status_code == 400 and overridden and not simplified
+                    and any(h in r.text.lower() for h in OVERRIDE_HINTS)):
+                log.warning("stage %s: API rejected model/effort override (%s); falling back to %s for this run",
+                            stage, r.text[:200], settings.claude_model)
+                _degraded.add(stage)
+                body = stage_body(stage, body)
+                simplified = True
+                continue
             raise AIError(f"Claude API {r.status_code}: {r.text[:300]}")
-        return r.json()
-    raise AIError("Claude API unavailable after retries.")
+        data = r.json()
+        costs.record(stage, body.get("model", ""), data.get("usage") or {})
+        return data
 
 
-async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000, tool: dict | None = None) -> str:
+async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000, tool: dict | None = None,
+                 stage: str = "other") -> str:
     """Call Claude. With `tool`, ask for that tool and return its input as a JSON string.
 
     Some current models reject a forced tool_choice, so we use tool_choice=auto plus an explicit instruction,
@@ -225,7 +272,7 @@ async def claude(system: str, content: list[dict] | str, max_tokens: int = 2000,
         body["tool_choice"] = {"type": "auto"}
     texts: list[str] = []
     for _ in range(3 if tool else 1):
-        data = await _post(body)
+        data = await _post(stage_body(stage, body), stage)
         blocks = data.get("content", [])
         if tool:
             for b in blocks:
@@ -279,7 +326,9 @@ async def analyze(
         f"Transcript:\n{transcript[:20000] or '(no audio / no transcript)'}",
     ]
     content.append({"type": "text", "text": "\n\n".join(ctx)})
-    raw = await claude(ANALYZE_SYSTEM, content, max_tokens=2000, tool=ANALYSIS_TOOL)
+    # max_tokens also has to hold the model's (hidden, billed) thinking; too low a ceiling truncates the tool
+    # call and forces a nudge that re-sends every frame. Only tokens actually used are billed.
+    raw = await claude(ANALYZE_SYSTEM, content, max_tokens=4000, tool=ANALYSIS_TOOL, stage="analyze")
     data = parse_json(raw)
     cat = str(data.get("category", "other")).lower()
     data["category"] = cat if cat in CATEGORIES else "other"
@@ -296,7 +345,7 @@ async def analyze_text(text: str, url: str = "") -> dict[str, Any]:
     raw = await claude(
         ANALYZE_SYSTEM,
         f"Content type: text note\nSource URL: {url or '(none)'}\nText:\n{text[:8000]}",
-        max_tokens=800, tool=ANALYSIS_TOOL,
+        max_tokens=2500, tool=ANALYSIS_TOOL, stage="tag",
     )
     return parse_json(raw)
 
@@ -314,14 +363,13 @@ async def answer(question: str, items: list[dict]) -> str:
             f"Transcript excerpt: {(it.get('transcript') or '')[:1500]}"
         )
     prompt = f"Question: {question}\n\nSaved items:\n\n" + "\n\n---\n\n".join(blocks)
-    return await claude(ASK_SYSTEM, prompt, max_tokens=1200)
+    return await claude(ASK_SYSTEM, prompt, max_tokens=2000, stage="ask")
 
 
 async def resolve_resources(resources: list[dict], context: str) -> list[dict]:
     """Use Claude + web search to find canonical links for extracted resources."""
     if not settings.anthropic_key or not resources:
         return []
-    headers = {"x-api-key": settings.anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     prompt = (
         f"Post context:\n{context[:4000]}\n\nResources to find:\n"
         + json.dumps(resources, ensure_ascii=False, indent=1)
@@ -331,10 +379,7 @@ async def resolve_resources(resources: list[dict], context: str) -> list[dict]:
     for _ in range(4):  # allow pause_turn continuations
         body = {"model": settings.claude_model, "max_tokens": 4000, "system": RESOLVE_SYSTEM,
                 "messages": messages, "tools": tools}
-        r = await _client.post(ANTHROPIC_URL, headers=headers, json=body, timeout=240)
-        if r.status_code >= 400:
-            raise AIError(f"Claude API {r.status_code}: {r.text[:300]}")
-        data = r.json()
+        data = await _post(stage_body("resolve", body), "resolve", timeout=240)
         content = data.get("content", [])
         for b in content:
             if b.get("type") == "tool_use" and b.get("name") == "report_resources":
@@ -386,7 +431,7 @@ SKILL_TOOL = {
 
 
 async def draft_skill(material: str) -> dict[str, Any]:
-    raw = await claude(SKILL_SYSTEM, material[:60000], max_tokens=6000, tool=SKILL_TOOL)
+    raw = await claude(SKILL_SYSTEM, material[:60000], max_tokens=8000, tool=SKILL_TOOL, stage="skill")
     return parse_json(raw)
 
 
@@ -423,5 +468,5 @@ BREAKDOWN_TOOL = {
 async def compose_breakdown(item_text: str, resource_names: list[str], extra: str = "") -> dict[str, Any]:
     prompt = (f"{item_text[:20000]}\n\n# Resources found (use these exact names)\n"
               + "\n".join(f"- {n}" for n in resource_names) + (f"\n\n{extra}" if extra else ""))
-    raw = await claude(BREAKDOWN_SYSTEM, prompt, max_tokens=2000, tool=BREAKDOWN_TOOL)
+    raw = await claude(BREAKDOWN_SYSTEM, prompt, max_tokens=3000, tool=BREAKDOWN_TOOL, stage="breakdown")
     return parse_json(raw)

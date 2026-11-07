@@ -9,9 +9,9 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from . import ai, media, resources, security, todoist
+from . import ai, costs, media, resources, security, todoist
 from .config import settings
-from .db import DB
+from .db import DB, now_iso
 from .telegram import BOT_API_FILE_LIMIT, Telegram, esc
 
 log = logging.getLogger("hub.bot")
@@ -34,8 +34,9 @@ HELP = """<b>Your knowledge hub</b>
 /ask &lt;question&gt; — answer from everything saved
 /resources — links, repos and skills found in your saves
 /skills — skill drafts waiting for review
-/find 12 — re-run resource search for an item · /skill 12 — draft a skill from it
+/find 12 — re-run resource search for an item · /skill 12 — draft a skill from it (on demand)
 /security 12 — full security report (why + how to make it safer)
+/cost — estimated AI spend today / this week
 Failed jobs retry automatically (3 tries). /failed — items that still failed · /retry 12 or /retry failed — try again
 /recent — latest items · /get 12 · /delete 12
 /status — health check
@@ -133,6 +134,8 @@ class Hub:
             return await self.cmd_retry(chat_id, arg, mid)
         if cmd == "/security":
             return await self.cmd_security(chat_id, arg)
+        if cmd == "/cost":
+            return await self.tg.send(chat_id, self.cost_text())
         if cmd == "/skills":
             return await self.cmd_skills(chat_id)
         if cmd in ("/find", "/skill"):
@@ -192,8 +195,28 @@ class Hub:
             f"{ok(settings.transcriber != 'none')} Transcription: {esc(settings.transcriber)}\n"
             f"{ok(bool(settings.todoist_token))} Todoist\n"
             f"{ok(bool(settings.ig_cookies))} Instagram cookies\n"
-            f"{ok(bool(settings.mcp_secret))} MCP connector"
+            f"{ok(bool(settings.mcp_secret))} MCP connector\n"
+            f"AI spend today (est.): ${costs.spent_today():.2f}"
+            + (f" of ${settings.daily_spend_cap_usd:.2f} cap" if settings.daily_spend_cap_usd else "") + " · /cost"
         )
+
+    def cost_text(self) -> str:
+        s = costs.summary()
+        lines = ["<b>Estimated AI spend</b> (from the token counts the API reports × list prices)"]
+        for label, d in s.items():
+            per = f" · ~${d['cost'] / d['items']:.3f}/item" if d["items"] else ""
+            lines.append(f"<b>{label}</b>: ${d['cost']:.2f} — {d['calls']} calls, {d['items']} items, "
+                         f"{d['searches']} web searches{per}")
+        week = s["7 days"]["by_stage"]
+        if week:
+            lines.append("\n<b>Last 7 days by step</b>\n" + "\n".join(
+                f"• {esc(st or 'other')}: ${c:.2f} ({n} calls)" for st, (c, n) in week.items()))
+        cap = settings.daily_spend_cap_usd
+        lines.append(f"\nDaily cap: ${cap:.2f}" + (" — <b>reached: cheap mode until midnight UTC</b>" if costs.over_cap() else "")
+                     if cap else "\nDaily cap: off")
+        lines.append(f"<i>Prices as of {costs.PRICES_AS_OF}. Estimates only; the Anthropic Console has the real bill. "
+                     "Calls made before this tracking was added aren't counted.</i>")
+        return "\n".join(lines)
 
     async def cmd_recent(self, chat_id: int, arg: str) -> None:
         n = int(arg) if arg.isdigit() else 10
@@ -335,6 +358,8 @@ class Hub:
         it = self.db.get(item_id) if item_id is not None else None
         if not it:
             return
+        if isinstance(e, ai.AccountError):
+            return await self._park_account_error(job, p, it, err)
         meta = it.get("meta") or {}
         attempts = meta.setdefault("attempts", {})
         n = int(attempts.get(job, 0)) + 1
@@ -370,9 +395,47 @@ class Hub:
                 reply_to=p.get("mid"),
             )
 
+    async def _park_account_error(self, job: str, p: dict, it: dict, err: str) -> None:
+        """Out of credit / bad API key: retrying can't help. Park the item (no retries) and tell Sahil once."""
+        item_id = it["id"]
+        meta = it.get("meta") or {}
+        meta.setdefault("errors", []).append({"job": job, "attempt": int((meta.get("attempts") or {}).get(job, 0)) + 1,
+                                              "error": err})
+        meta["errors"] = meta["errors"][-9:]
+        (meta.get("pending_jobs") or {}).pop(job, None)
+        meta["needs_attention"] = True
+        meta["parked"] = {"job": job, "reason": "account", "at": now_iso()}
+        fields: dict[str, Any] = {"meta": meta}
+        if job in self.ITEM_JOBS:
+            fields.update(status="error", error="Parked: " + err)
+        self.db.update(item_id, **fields)
+        log.warning("job %s #%s parked (account/billing error, not retried): %s", job, item_id, err)
+        chat_id = p.get("chat_id") or next(iter(sorted(self.owner_ids())), None)
+        last = self.db.kv_get("account_alert_at")
+        if last:
+            try:
+                from datetime import datetime, timezone
+                age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 3600
+                if age_h < settings.billing_alert_hours:
+                    return
+            except ValueError:
+                pass
+        if not chat_id:
+            return
+        self.db.kv_set("account_alert_at", now_iso())
+        credit = "credit" in err.lower() or "billing" in err.lower()
+        what = ("⚠️ <b>Anthropic API credits are out</b> — add funds at console.anthropic.com → Billing, "
+                "then send /retry failed." if credit else
+                "⚠️ <b>The Anthropic API key was rejected</b> (invalid or not allowed) — fix ANTHROPIC_API_KEY, "
+                "then send /retry failed.")
+        await self.tg.send(chat_id, f"{what}\n\nI've saved #{item_id} and parked it without retrying; anything else "
+                                    f"you send is saved and parked the same way. I won't repeat this message for "
+                                    f"{settings.billing_alert_hours:g} hours.", reply_to=p.get("mid"))
+
     async def worker(self) -> None:
         while True:
             job, p = await self.queue.get()
+            costs.current_item.set(p.get("item_id"))
             try:
                 if job == "url":
                     await self.process_url(**p)
@@ -500,7 +563,7 @@ class Hub:
         res[0]["security"] = sec
         imported = self._skill_files(info) if sec["verdict"] != "red" else []
         self.db.update(item_id, resources=res, meta=self._meta(item_id) | {"imported_skills": imported, "security_checked": True})
-        nxt = "skill" if settings.anthropic_key and (imported or it.get("skill_candidate")) else "breakdown"
+        nxt = "skill" if settings.anthropic_key and self._auto_skill(chat_id) and (imported or it.get("skill_candidate")) else "breakdown"
         self.enqueue((nxt, {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
 
     async def process_page_link(self, item_id: int, chat_id: int, mid: int, url: str, note: str, err: str) -> None:
@@ -516,6 +579,8 @@ class Hub:
                 a = await ai.analyze_text(f"{note}\n\nPage title: {fields['title']}\n\n{fields.get('caption', '')}".strip(), url)
                 fields.update(self._analysis_fields(a))
                 fields["meta"] = self._meta(item_id) | {"extracted_resources": a.get("resources") or []}
+            except ai.AccountError:
+                raise
             except Exception as e:
                 log.warning("page analysis failed: %s", e)
         self.db.update(item_id, **fields)
@@ -535,14 +600,41 @@ class Hub:
             self.enqueue(("resources", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
             return True
         if a.get("skill_candidate"):
-            self.enqueue(("skill", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+            nxt = "skill" if self._auto_skill(chat_id) else "breakdown"
+            self.enqueue((nxt, {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
             return True
         return False
+
+    # ------------------------------------------------------------------ cost controls
+    def _auto_skill(self, chat_id: int | None = None) -> bool:
+        """Draft skills automatically? Off by default (on demand with /skill 12); never when over the daily cap."""
+        return settings.auto_skill_draft and not self._cheap_mode(chat_id)
+
+    @staticmethod
+    def _fire(coro: Any) -> None:
+        try:
+            asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:  # no loop (sync caller): drop the notice rather than crash
+            coro.close()
+
+    def _cheap_mode(self, chat_id: int | None = None) -> bool:
+        """True when today's estimated spend has reached the cap. Tells Sahil once per UTC day."""
+        if not costs.over_cap():
+            return False
+        today = now_iso()[:10]
+        if chat_id and self.db.kv_get("cap_alert_day") != today:
+            self.db.kv_set("cap_alert_day", today)
+            self._fire(self.tg.send(chat_id, (
+                f"💸 Today's estimated AI spend reached ${costs.spent_today():.2f} "
+                f"(daily cap ${settings.daily_spend_cap_usd:.2f}). Until midnight UTC I'll only do the cheap steps: "
+                "summary, exact repo links and the automatic safety scan. No web searches, no AI security review, "
+                "no skill drafts. /find 12 or /skill 12 still run a step on request. /cost for details.")))
+        return True
 
     @staticmethod
     def _ack(it: dict) -> str:
         return (f"✅ Got it (#{it['id']}): <b>{esc(it.get('title') or 'saved')}</b>\n"
-                "🔎 Finding the links, screening them for safety and checking for a skill — "
+                "🔎 Finding the links and screening them for safety — "
                 "you'll get one full breakdown in a few minutes.")
 
     @staticmethod
@@ -594,7 +686,24 @@ class Hub:
                 resolved.append({"name": repo_meta["full_name"], "type": "github", "found": True, "url": repo_meta["url"],
                                  "confidence": "high", "description": repo_meta["description"],
                                  "verified": "repo slug shown in the post, confirmed on GitHub"})
-        # 3) Web search only for what is still unresolved, and reject generic / non-matching results.
+        # 3) Well-known products get their official link for free; web search (paid) only for specific named
+        #    things still unresolved, never in cheap mode unless Sahil asked (/find), and reject generic results.
+        searchable = []
+        for r in rest:
+            wk = resources.well_known(r)
+            if wk:
+                resolved.append(wk)
+            elif resources.needs_search(r):
+                searchable.append(r)
+            else:
+                resolved.append({**r, "found": False, "url": "", "confidence": "low",
+                                 "note": "Too generic to look up (no name, handle or repo shown)."})
+        rest = searchable
+        if rest and self._cheap_mode(chat_id) and not force:
+            resolved += [{**r, "found": False, "url": "", "confidence": "low",
+                          "note": f"Not searched: daily AI spending cap reached. /find {item_id} to search now."}
+                         for r in rest]
+            rest = []
         if rest:
             web = await ai.resolve_resources(rest, context)
             orig = {(r.get("name") or "").lower(): r for r in rest}
@@ -604,6 +713,7 @@ class Hub:
                 resolved.append(await resources.validate_resolved(merged))
         imported = list(meta.get("imported_skills") or [])
         screened = 0
+        resolved = self._dedupe(resolved)
         for r in resolved:
             url = r.get("url") or ""
             if resources.parse_github(url):
@@ -621,8 +731,25 @@ class Hub:
         meta["imported_skills"] = imported[:12]
         meta["security_checked"] = True
         self.db.update(item_id, resources=resolved, meta=meta)
-        need_skill = bool(imported or it.get("skill_candidate"))
+        need_skill = bool(imported or it.get("skill_candidate")) and self._auto_skill(chat_id)
         self.enqueue(("skill" if need_skill else "breakdown", {"item_id": item_id, "chat_id": chat_id, "mid": mid}))
+
+    @staticmethod
+    def _dedupe(resolved: list[dict]) -> list[dict]:
+        """One entry per repo/URL, so the same repo is never looked up or screened twice in one item."""
+        out, seen = [], {}
+        for r in resolved:
+            gh = resources.parse_github(r.get("url") or "")
+            key = ("gh:" + "/".join(gh).lower()) if gh else (r.get("url") or "").rstrip("/").lower()
+            if key and key in seen:
+                prev = seen[key]
+                if r.get("name") and r.get("name") != prev.get("name"):
+                    prev.setdefault("aliases", []).append(r["name"])
+                continue
+            if key:
+                seen[key] = r
+            out.append(r)
+        return out
 
     def item_text(self, it: dict) -> str:
         parts = [
@@ -674,6 +801,8 @@ class Hub:
         if settings.anthropic_key:
             try:
                 bd = await ai.compose_breakdown(self.item_text(it), names)
+            except ai.AccountError:
+                raise
             except Exception as e:
                 log.warning("breakdown compose failed, using fallback: %s", e)
         if not bd.get("items"):
@@ -714,6 +843,9 @@ class Hub:
     def render_breakdown(self, it: dict, bd: dict) -> str:
         res = it.get("resources") or []
         by_name = {(r.get("name") or "").lower(): r for r in res}
+        for r in res:
+            for a in r.get("aliases") or []:
+                by_name.setdefault(a.lower(), r)
         used: set[int] = set()
         icon = {"video": "🎬", "image": "🖼", "link": "🔗", "note": "📝", "voice": "🎙"}.get(it.get("kind"), "•")
         head = f"{icon} <b>#{it['id']} · {esc(bd.get('headline') or it.get('title') or '')}</b>"
@@ -750,6 +882,8 @@ class Hub:
             line += ("\n🔴 Blocked by security screening. /security " + str(it["id"]) if d.get("status") == "blocked"
                      else "\nTo install, tell Claude: “review my skill inbox”.")
             parts.append(line)
+        elif not d and it.get("skill_candidate") and it.get("skill_idea"):
+            parts.append(f"💡 <b>Skill idea:</b> {esc(it['skill_idea'])}\nSend /skill {it['id']} to have it drafted.")
         cav = (bd.get("caveats") or [])[:2]
         if cav:
             parts.append("<i>⚠️ " + " · ".join(esc(c) for c in cav) + "</i>")
@@ -778,7 +912,8 @@ class Hub:
             redo_photo = (it.get("kind") == "link" and media.instagram_shortcode(it.get("source_url") or "")
                           and not (it.get("meta") or {}).get("frames"))
             if it["status"] != "error" and not redo_photo:  # item itself fine: a follow-up job failed (resources / skill)
-                last = next((x["job"] for x in reversed(meta.get("errors") or []) if x["job"] in ("resources", "skill")), None)
+                last = next((x["job"] for x in reversed(meta.get("errors") or [])
+                             if x["job"] in ("resources", "skill", "breakdown")), None)
                 if last:
                     self.enqueue((last, {"item_id": it["id"], "chat_id": chat_id, "mid": mid, "force": True}))
                     n += 1

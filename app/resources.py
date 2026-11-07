@@ -141,11 +141,35 @@ GENERIC = {"skill", "skills", "claude", "code", "the", "open", "source", "free",
            "template", "templates", "mcp", "server", "best", "top", "new"}
 
 
+# Words that show up as "A/B" in captions and transcripts but are not GitHub owner/repo pairs.
+UNITS = {"min", "mins", "h", "hr", "hrs", "s", "sec", "kg", "g", "mg", "mcg", "ml", "dl", "l", "mmhg", "m2", "day", "wk",
+         "week", "month", "mo", "yr", "year", "dose", "kgmin", "hour", "hours", "night", "unit", "units", "meq", "mmol"}
+BRANDS = {"chatgpt", "claude", "gemini", "openai", "anthropic", "gpt", "gpt4", "gpt5", "copilot", "cursor", "perplexity",
+          "grok", "llama", "mistral", "deepseek", "midjourney", "notion", "obsidian", "canva", "capcut", "figma", "zapier",
+          "make", "n8n", "mac", "macos", "windows", "linux", "ios", "android", "iphone", "ipad", "web", "desktop", "mobile",
+          "youtube", "instagram", "tiktok", "twitter", "x", "reddit", "linkedin", "google", "apple", "microsoft", "excel",
+          "word", "slack", "discord", "telegram", "whatsapp", "email", "gmail", "pdf", "csv", "png", "jpg", "mp4", "api",
+          "ui", "ux", "frontend", "backend", "dev", "prod", "beginner", "advanced", "pro", "plus", "max", "free", "paid"}
+
+
+def is_junk_slug(owner: str, repo: str, explicit: bool = False) -> bool:
+    """True for "L/min", "ChatGPT/Claude", "iOS/Android"-style pairs. `explicit` = written as a github.com URL."""
+    o, r = owner.lower(), repo.lower()
+    if f"{o}/{r}" in NOT_SLUGS or owner.isdigit() or repo.isdigit() or len(repo) < 2:
+        return True
+    if explicit:
+        return False
+    if r in UNITS or (len(owner) == 1 and not owner.isdigit()):
+        return True
+    return o in BRANDS and r in BRANDS
+
+
 def find_slugs(text: str) -> list[tuple[str, str]]:
     out = []
     for m in SLUG_RE.finditer(text or ""):
         owner, repo = m.group(1), re.sub(r"\.git$", "", m.group(2).rstrip(".,;:)"))
-        if f"{owner}/{repo}".lower() in NOT_SLUGS or owner.isdigit() or repo.isdigit() or len(repo) < 2:
+        explicit = "github.com/" in m.group(0).lower()
+        if is_junk_slug(owner, repo, explicit):
             continue
         if repo.lower().endswith((".png", ".jpg", ".html", ".md")):
             continue
@@ -220,6 +244,42 @@ async def direct_resolve(resources: list[dict], item_text: str) -> tuple[list[di
         else:
             unresolved.append(r)
     return resolved, unresolved
+
+
+# Household-name tools: give the official link for free instead of paying for a web search to find it.
+WELL_KNOWN = {
+    "claude": "https://claude.ai", "claude code": "https://claude.com/product/claude-code",
+    "claude desktop": "https://claude.ai/download", "anthropic": "https://www.anthropic.com",
+    "chatgpt": "https://chatgpt.com", "openai": "https://openai.com", "gemini": "https://gemini.google.com",
+    "notebooklm": "https://notebooklm.google.com", "perplexity": "https://www.perplexity.ai", "cursor": "https://cursor.com",
+    "github copilot": "https://github.com/features/copilot", "notion": "https://www.notion.so",
+    "obsidian": "https://obsidian.md", "canva": "https://www.canva.com", "capcut": "https://www.capcut.com",
+    "figma": "https://www.figma.com", "zapier": "https://zapier.com", "n8n": "https://n8n.io",
+    "midjourney": "https://www.midjourney.com", "elevenlabs": "https://elevenlabs.io", "replit": "https://replit.com",
+    "lovable": "https://lovable.dev", "v0": "https://v0.app", "github": "https://github.com",
+    "todoist": "https://todoist.com", "railway": "https://railway.com", "vercel": "https://vercel.com",
+    "uworld": "https://www.uworld.com", "anki": "https://apps.ankiweb.net", "pubmed": "https://pubmed.ncbi.nlm.nih.gov",
+}
+
+
+def well_known(resource: dict) -> dict | None:
+    """Resolve a resource that is just a well-known product name (no repo/skill/prompt of its own)."""
+    name = re.sub(r"\s+", " ", (resource.get("name") or "").lower().strip())
+    name = re.sub(r"^(the )|( app| ai| website| tool)$", "", name).strip()
+    if str(resource.get("type", "")).lower() in ("github", "skill", "prompt", "template", "dataset", "paper", "course"):
+        return None
+    url = WELL_KNOWN.get(name)
+    if not url:
+        return None
+    return {**resource, "found": True, "url": url, "confidence": "high",
+            "description": resource.get("context") or resource.get("name"), "verified": "well-known product (no search needed)"}
+
+
+def needs_search(resource: dict) -> bool:
+    """Worth a paid web search? Only for a specific, named thing — not a bare generic word."""
+    if resource.get("url") or resource.get("identifiers") or resource.get("how_to_get"):
+        return True
+    return bool(name_tokens(resource.get("name", "")))
 
 
 async def validate_resolved(resource: dict) -> dict:
